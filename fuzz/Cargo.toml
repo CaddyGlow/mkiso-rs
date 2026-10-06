@@ -1,0 +1,28 @@
+[package]
+name = "libmkiso-fuzz"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+publish = false
+license = "MIT"
+
+[workspace]
+
+[dependencies]
+honggfuzz = "0.5"
+libmkiso = { path = "..", features = ["cli"] }
+sha2 = "0.10"
+serde_json = "1.0"
+toml = "0.9"
+tempfile = "3.23"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[profile.release]
+debug = 1
+overflow-checks = true
+
+[lints.clippy]
+# Preserve established iterator/remainder handling during the Rust 1.99 upgrade.
+chunks_exact_to_as_chunks = "allow"
