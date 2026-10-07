@@ -188,23 +188,69 @@ fn malformed_joliet_ucs2_is_rejected() {
 
 #[test]
 fn primary_display_collisions_are_rejected_or_aliased() {
+    use libmkiso::tree_source::*;
+    use std::{io, sync::Arc};
+    // A deferred inventory can represent case-sensitive names even when the
+    // host filesystem cannot create this directory/file pair (e.g. Windows).
+    struct Source(TreeInventory);
+    impl FileTreeSource for Source {
+        fn inventory(&self, entries: usize, bytes: usize) -> io::Result<TreeInventory> {
+            self.0.validate_budget(entries, bytes)?;
+            Ok(self.0.clone())
+        }
+    }
+    let source = Source(TreeInventory {
+        entries: vec![
+            TreeEntry {
+                path: "FOO".into(),
+                native_name: b"FOO".to_vec(),
+                object: 1,
+                kind: TreeEntryKind::Directory,
+                streams: vec![],
+                metadata: Default::default(),
+            },
+            TreeEntry {
+                path: "foo".into(),
+                native_name: b"foo".to_vec(),
+                object: 2,
+                kind: TreeEntryKind::File(vec![TreeExtent::Data(DeferredContent::new(Arc::new(
+                    BufferContent::new(2, b"file".to_vec()),
+                )))]),
+                streams: vec![],
+                metadata: Default::default(),
+            },
+        ],
+        ..Default::default()
+    });
     let temp = tempfile::tempdir().unwrap();
-    let source = temp.path().join("source");
-    fs::create_dir_all(source.join("FOO")).unwrap();
-    fs::write(source.join("foo"), b"file").unwrap();
-    let output = temp.path().join("disc.iso");
-    assert!(libmkiso::write_iso9660(&source, &output).is_err());
-    write_iso9660_with_options(
+    assert!(
+        libmkiso::stage_iso9660_from_tree_source(
+            &source,
+            temp.path(),
+            &IsoOptions::default(),
+            || Ok(())
+        )
+        .is_err()
+    );
+    assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 0);
+    let output = libmkiso::stage_iso9660_from_tree_source(
         &source,
-        &output,
+        temp.path(),
         &IsoOptions {
             filename_policy: FilenamePolicy::Mangle,
-            ..IsoOptions::default()
+            ..Default::default()
         },
+        || Ok(()),
     )
     .unwrap();
-    let reader = IsoReader::open(fs::File::open(output).unwrap(), Limits::default()).unwrap();
+    let mut reader = IsoReader::open(fs::File::open(output).unwrap(), Limits::default()).unwrap();
     assert_ne!(reader.entries()[0].name, reader.entries()[1].name);
+    let file = reader
+        .entries()
+        .iter()
+        .position(|entry| !entry.directory)
+        .unwrap();
+    assert_eq!(reader.read_entry(file, 4).unwrap(), b"file");
 }
 
 #[test]

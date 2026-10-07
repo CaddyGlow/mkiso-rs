@@ -311,34 +311,11 @@ fn scan(
         }
     }
     children.sort_by(|a, b| a.path.cmp(&b.path));
-    if options.filename_policy == FilenamePolicy::Mangle {
-        let mut used = HashSet::new();
-        for (ordinal, node) in children.iter_mut().enumerate() {
-            if !used.insert(display_identifier(node)) {
-                let mut suffix = 0usize;
-                loop {
-                    let alias = if node.directory {
-                        format!("D{ordinal:X}_{suffix:X}")
-                    } else {
-                        format!("F{ordinal:X}_{suffix:X}")
-                    };
-                    node.name = identifier_for_level(&alias, node.directory, options.level)?;
-                    if used.insert(display_identifier(node)) {
-                        break;
-                    }
-                    suffix += 1;
-                }
-            }
-        }
+    let mut used = HashSet::new();
+    for (ordinal, node) in children.iter_mut().enumerate() {
+        assign_primary_name(node, ordinal, &mut used, options)?;
     }
     children.sort_by(|a, b| a.name.cmp(&b.name));
-    let mut displayed = HashSet::new();
-    if children
-        .iter()
-        .any(|node| !displayed.insert(display_identifier(node)))
-    {
-        return Err(unsupported("source names collide after ASCII uppercasing"));
-    }
     for node in children {
         if path_length + node.name.len() > options.max_path_bytes {
             return Err(unsupported("ISO9660 path length after aliasing"));
@@ -353,6 +330,33 @@ fn scan(
         }
     }
     Ok(())
+}
+// Host and deferred inventories use the same display-name collision rules.
+fn assign_primary_name(
+    node: &mut Node,
+    ordinal: usize,
+    used: &mut HashSet<Vec<u8>>,
+    options: &IsoOptions,
+) -> Result<()> {
+    if used.insert(display_identifier(node)) {
+        return Ok(());
+    }
+    if options.filename_policy != FilenamePolicy::Mangle {
+        return Err(unsupported("source names collide after ASCII uppercasing"));
+    }
+    let mut suffix = 0usize;
+    loop {
+        let alias = if node.directory {
+            format!("D{ordinal:X}_{suffix:X}")
+        } else {
+            format!("F{ordinal:X}_{suffix:X}")
+        };
+        node.name = identifier_for_level(&alias, node.directory, options.level)?;
+        if used.insert(display_identifier(node)) {
+            return Ok(());
+        }
+        suffix += 1;
+    }
 }
 fn identifier_for_level(name: &str, directory: bool, level: IsoLevel) -> Result<Vec<u8>> {
     let bytes = identifier(name, directory)?;
@@ -1312,11 +1316,6 @@ fn stage_inventory(
         } else {
             Vec::new()
         };
-        if nodes[parent].children.iter().any(|&index| {
-            nodes[index].name == name || options.joliet && nodes[index].joliet_name == joliet_name
-        }) {
-            return Err(unsupported("ISO destination name collision"));
-        }
         let index = nodes.len();
         nodes.push(Node {
             path: PathBuf::from(&entry.path),
@@ -1338,6 +1337,17 @@ fn stage_inventory(
         nodes[parent].children.push(index);
         if paths.insert(entry.path, index).is_some() {
             return Err(unsupported("duplicate source path"));
+        }
+    }
+    for parent in 0..nodes.len() {
+        let children = nodes[parent].children.clone();
+        let mut primary = HashSet::new();
+        let mut joliet = HashSet::new();
+        for (ordinal, child) in children.into_iter().enumerate() {
+            assign_primary_name(&mut nodes[child], ordinal, &mut primary, options)?;
+            if options.joliet && !joliet.insert(nodes[child].joliet_name.clone()) {
+                return Err(unsupported("Joliet destination name collision"));
+            }
         }
     }
     let (file, path) = tempfile::NamedTempFile::new_in(directory)?.into_parts();

@@ -69,10 +69,15 @@ fn invalid_names_and_case_collisions_leave_no_output() {
     assert!(write_iso9660(&source, &output).is_err());
     assert!(!output.exists());
     fs::remove_file(source.join("bad-name")).unwrap();
-    fs::write(source.join("same.txt"), []).unwrap();
-    fs::write(source.join("SAME.TXT"), []).unwrap();
-    assert!(write_iso9660(&source, &output).is_err());
-    assert!(!output.exists());
+    // Host case-collision fixtures require a case-sensitive filesystem.
+    // The deferred inventory collision test also exercises this on Windows.
+    #[cfg(not(windows))]
+    {
+        fs::write(source.join("same.txt"), []).unwrap();
+        fs::write(source.join("SAME.TXT"), []).unwrap();
+        assert!(write_iso9660(&source, &output).is_err());
+        assert!(!output.exists());
+    }
 }
 
 #[test]
