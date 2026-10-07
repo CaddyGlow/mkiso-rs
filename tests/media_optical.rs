@@ -82,10 +82,14 @@ fn source_mutation_never_publishes_output() {
         cancellation: &token,
         operation_id: 2,
     };
-    assert!(matches!(
-        optical::create(&source, &output, &CreateOptions::default(), &mut ctx),
-        Err(Error::InvalidInput(_))
-    ));
+    let error = optical::create(&source, &output, &CreateOptions::default(), &mut ctx)
+        .expect_err("mutated source must not be published");
+    // The writer may detect drift before the orchestration snapshot check.
+    assert!(
+        matches!(error, Error::InvalidInput(_))
+            || matches!(&error, Error::Unsupported(message) if message == "source file size changed during creation"),
+        "unexpected mutation error: {error}"
+    );
     assert!(!output.exists());
 }
 #[test]
