@@ -511,25 +511,40 @@ fn invalid_profiles_and_resource_limits_do_not_publish() {
     }
 }
 
-#[cfg(unix)]
 #[test]
 fn long_symbolic_links_use_chained_continuations_and_cycles_are_rejected() {
-    use std::os::unix::fs::symlink;
+    use libmkiso::tree_source::{FileTreeSource, TreeEntry, TreeEntryKind, TreeInventory};
+    struct Source(TreeInventory);
+    impl FileTreeSource for Source {
+        fn inventory(&self, entries: usize, bytes: usize) -> std::io::Result<TreeInventory> {
+            self.0.validate_budget(entries, bytes)?;
+            Ok(self.0.clone())
+        }
+    }
     let temp = tempfile::tempdir().unwrap();
-    let source = temp.path().join("source");
-    fs::create_dir(&source).unwrap();
     let target = std::iter::repeat_n("x".repeat(200), 15)
         .collect::<Vec<_>>()
         .join("/");
-    symlink(&target, source.join("link")).unwrap();
-    let output = temp.path().join("long.iso");
-    write_iso9660_with_options(
+    // The optical format supports targets longer than macOS host symlinks.
+    let source = Source(TreeInventory {
+        entries: vec![TreeEntry {
+            path: "link".into(),
+            native_name: b"link".to_vec(),
+            metadata: Default::default(),
+            object: 1,
+            kind: TreeEntryKind::Symlink(target.clone()),
+            streams: Vec::new(),
+        }],
+        ..Default::default()
+    });
+    let output = libmkiso::stage_iso9660_from_tree_source(
         &source,
-        &output,
+        temp.path(),
         &IsoOptions {
             rock_ridge: true,
             ..Default::default()
         },
+        || Ok(()),
     )
     .unwrap();
     let mut bytes = fs::read(output).unwrap();
@@ -539,6 +554,7 @@ fn long_symbolic_links_use_chained_continuations_and_cycles_are_rejected() {
             .as_deref(),
         Some(target.as_str())
     );
+    #[cfg(not(target_os = "macos"))] // Host extraction cannot create a 3 KiB macOS symlink.
     if let Some(command) = external("xorriso", "XORRISO") {
         let image = temp.path().join("independent-long.iso");
         fs::write(&image, &bytes).unwrap();
