@@ -11,6 +11,16 @@ extent APIs without sibling path overrides. Main commit `f41404f` passed
 and is the target of `v0.1.3`. Publication is registry evidence, distinct from
 firmware, Windows-installation or downstream FAT-builder correctness.
 
+[libmkiso 0.1.4](https://crates.io/crates/libmkiso/0.1.4) was published and downloaded
+from crates.io on 2026-10-07. It adds exclusive directory publication on macOS and
+Windows, with regression tests protecting existing files and empty directories.
+Commit `e9b3870` passed [Linux, Windows and macOS CI](https://github.com/CaddyGlow/mkiso-rs/actions/runs/37689511318).
+The [v0.1.4 release workflow](https://github.com/CaddyGlow/mkiso-rs/actions/runs/37689894998)
+passed package verification, embedded version checks and release CLI tests on all
+three platforms, then published the crate archive, binaries and checksums in the
+[GitHub release](https://github.com/CaddyGlow/mkiso-rs/releases/tag/v0.1.4).
+The additive topology and classified-extent APIs remain available from 0.1.3.
+
 ## Portable retained sources (R1)
 
 All source and reader APIs are available without default features:
