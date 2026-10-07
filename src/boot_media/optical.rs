@@ -473,7 +473,28 @@ fn publish_directory(source: &Path, destination: &Path) -> Result<()> {
     }
     #[cfg(windows)]
     {
-        fs::rename(source, destination)?;
+        use std::os::windows::ffi::OsStrExt;
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            #[link_name = "MoveFileExW"]
+            fn move_file_ex_w(source: *const u16, destination: *const u16, flags: u32) -> i32;
+        }
+        let wide = |path: &Path| -> Result<Vec<u16>> {
+            let mut value: Vec<u16> = path.as_os_str().encode_wide().collect();
+            if value.contains(&0) {
+                return Err(Error::InvalidInput("NUL in publication path".into()));
+            }
+            value.push(0);
+            Ok(value)
+        };
+        let source = wide(source)?;
+        let destination = wide(destination)?;
+        // Both UTF-16 strings remain live and terminated for the call. Flags
+        // exclude replacement and cross-volume copying; std::fs::rename may
+        // replace an empty destination directory on Windows.
+        if unsafe { move_file_ex_w(source.as_ptr(), destination.as_ptr(), 0) } == 0 {
+            return Err(io::Error::last_os_error().into());
+        }
         Ok(())
     }
     #[cfg(target_os = "macos")]
