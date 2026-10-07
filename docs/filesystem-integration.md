@@ -2,10 +2,14 @@
 
 This development implementation follows `FILESYSTEM_REFACTOR_PLAN.md` without
 adding dependencies on partmgr, virtdisk, or an external filesystem core.
-The minimum **published** libmkiso version for every API below is **UNKNOWN**.
-Cargo version 0.1.3 is a local version, not evidence of crates.io availability.
-Consumers must verify a published release and resolve its manifests/lockfiles
-without sibling path overrides before release integration.
+The minimum **published** libmkiso version for this complete contract is **0.1.3**.
+[libmkiso 0.1.3](https://crates.io/crates/libmkiso/0.1.3) was published and independently
+downloaded from crates.io on 2026-10-07. A fresh consumer pinned to `=0.1.3` with
+`default-features = false` compiled the parent, native-name, root-ICB and classified
+extent APIs without sibling path overrides. Main commit `f41404f` passed
+[Linux and Windows CI](https://github.com/CaddyGlow/mkiso-rs/actions/runs/37687602934)
+and is the target of `v0.1.3`. Publication is registry evidence, distinct from
+firmware, Windows-installation or downstream FAT-builder correctness.
 
 ## Portable retained sources (R1)
 
@@ -60,9 +64,8 @@ last payload call. This is also required by the immutable-source contract.
 ## Native topology and classified extents (additive 0.1.3)
 
 These APIs require no default features, and are available on the portable wasm
-reader path. The local implementation version is **0.1.3**; its minimum
-**crates.io-published** version remains **UNKNOWN** until registry publication is
-verified independently of a local/path dependency or a GitHub release.
+reader path. Their minimum **crates.io-published** version is **0.1.3**, verified
+by a registry-only consumer after publication on 2026-10-07.
 
 ```rust,ignore
 topology::Parent::{Root, Entry(usize)};
