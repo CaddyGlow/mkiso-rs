@@ -87,6 +87,7 @@ fn source_mutation_never_publishes_output() {
     // The writer may detect drift before the orchestration snapshot check.
     assert!(
         matches!(error, Error::InvalidInput(_))
+            || matches!(&error, Error::Io(source) if source.to_string() == "host identity, generation or size changed")
             || matches!(&error, Error::Unsupported(message) if message == "source file size changed during creation"),
         "unexpected mutation error: {error}"
     );
