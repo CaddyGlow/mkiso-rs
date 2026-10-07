@@ -309,6 +309,7 @@ fn unreferenced_metadata_holes_are_allowed_but_referenced_holes_fail() {
     }
     let reader = UdfReader::open(&image, Limits::default()).unwrap();
     assert_eq!(reader.read_entry(0, 7).unwrap(), b"payload");
+    drop(reader);
     let logical = &mut image[259 * BLOCK..260 * BLOCK];
     put32(logical, 252, 64);
     seal(logical, 6, 259, 510, 3);
@@ -337,4 +338,37 @@ fn damaged_allocation_extent_descriptor_uses_duplicate_mirror() {
     image[(PARTITION + 98) * BLOCK + 24] ^= 1;
     let reader = UdfReader::open(&image, Limits::default()).unwrap();
     assert_eq!(reader.read_entry(0, 7).unwrap(), b"payload");
+}
+
+#[test]
+fn independent_native_metadata_is_inspected_for_root_and_file() {
+    use libmkiso::preservation::{Field, TimestampEncoding, TimestampPrecision};
+    for revision in [0x250, 0x260] {
+        let mut image = fixture(revision, false);
+        let stamp = [0x3c, 0x10, 0xea, 0x07, 10, 7, 12, 34, 56, 78, 90, 12];
+        for (physical, logical, length, uid) in [
+            (PARTITION + 96, 32, 220, 42),
+            (PARTITION + 97, 33, 192, 1001),
+        ] {
+            let descriptor = &mut image[physical * BLOCK..(physical + 1) * BLOCK];
+            put32(descriptor, 36, uid);
+            put32(descriptor, 40, 100);
+            put32(descriptor, 44, 0x1234);
+            descriptor[72..84].copy_from_slice(&stamp);
+            seal(descriptor, 261, logical, length, 3);
+        }
+        let reader = UdfReader::open(&image, Limits::default()).unwrap();
+        assert_eq!(reader.root_metadata().ownership, Field::Present((42, 100)));
+        let metadata = reader.metadata(0).unwrap();
+        assert_eq!(metadata.native_name, Field::Present(b"\x08file".to_vec()));
+        assert_eq!(metadata.ownership, Field::Present((1001, 100)));
+        assert_eq!(metadata.permissions, Field::Present(0x1234));
+        let Field::Present(timestamps) = &metadata.timestamps else {
+            panic!("timestamps not inspected")
+        };
+        assert_eq!(timestamps[0].1.bytes, stamp);
+        assert_eq!(timestamps[0].1.encoding, TimestampEncoding::Udf);
+        assert_eq!(timestamps[0].1.precision, TimestampPrecision::Microseconds);
+        assert_eq!(metadata.opaque, Field::Uninspected);
+    }
 }

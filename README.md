@@ -375,8 +375,11 @@ The UDF exports are `UdfReader`, `UdfLimits`, `UdfEntry`, `UdfEntryKind`,
 stream owner, ICB identity, and link target to distinguish ordinary files,
 associated streams, hard links, and symbolic links. `read_entry(id, maximum)`
 and `extract(id, sink)` provide buffered and streaming output respectively.
-Opening UDF still requires caller-owned image bytes. These exports do not add
-support for previously unsupported image layouts or alter archive-rs defaults.
+`UdfReader::open_source` retains a fixed-length positional `ReadAt` source;
+`open(&bytes, limits)` remains the slice adapter. `BoundedSource` translates a
+checked image region, and `SourceCursor` supplies independent ISO seek cursors.
+See the [filesystem integration ledger](docs/filesystem-integration.md) for
+deferred authoring, metadata preservation gates, and publication status.
 
 ```rust,no_run
 use libmkiso::{IsoNamespace, IsoReadOptions, IsoReader};

@@ -23,8 +23,8 @@ pub(super) struct VolumeMap {
 }
 impl VolumeMap {
     pub(super) fn open(
-        bytes: &[u8],
-        partitions: &[&[u8]],
+        bytes: &dyn crate::source::ReadAt,
+        partitions: &[Vec<u8>],
         logical: &[u8],
         limits: Limits,
         budget: &mut u64,
@@ -71,7 +71,7 @@ impl VolumeMap {
                 return Err(Error::Unsupported("multiple volume sequences".into()));
             }
             let start = u64::from(u32_at(partition, 188)?) * BLOCK;
-            if start > bytes.len() as u64 {
+            if start > bytes.len() {
                 return Err(bad("partition begins outside image"));
             }
             raw.push(map);
@@ -88,7 +88,7 @@ impl VolumeMap {
                     && u16_at(map, 38).ok() == Some(number)
             });
             if !has_virtual {
-                region(
+                super::check_region(
                     bytes,
                     u64::from(u32_at(partition, 188)?) * BLOCK,
                     u64::from(u32_at(partition, 192)?) * BLOCK,
@@ -221,6 +221,9 @@ impl VolumeMap {
                     }
                     (primary, Some(mirror))
                 }
+                (Err(error @ Error::Io(_)), _) | (_, Err(error @ Error::Io(_))) => {
+                    return Err(error);
+                }
                 (Ok(primary), Err(Error::ResourceLimit(reason)))
                 | (Err(Error::ResourceLimit(reason)), Ok(primary)) => {
                     let _ = primary;
@@ -327,7 +330,7 @@ impl VolumeMap {
         reason = "metadata bootstrap has explicit validated physical geometry"
     )]
     fn metadata(
-        bytes: &[u8],
+        bytes: &dyn crate::source::ReadAt,
         start: u64,
         _size: u64,
         location: u32,
@@ -356,33 +359,33 @@ impl VolumeMap {
             extent[0].offset.ok_or_else(|| bad("metadata ICB"))?,
             BLOCK,
         )?;
-        let kind = u16_at(descriptor, 0)?;
+        let kind = u16_at(&descriptor, 0)?;
         if !matches!(kind, 261 | 266) {
             return Err(bad("metadata file entry type"));
         }
-        tag(descriptor, kind, location)?;
+        tag(&descriptor, kind, location)?;
         if descriptor[27] != file_type
-            || u16_at(descriptor, 20)? != 4
-            || u16_at(descriptor, 34)? & 7 != 0
+            || u16_at(&descriptor, 20)? != 4
+            || u16_at(&descriptor, 34)? & 7 != 0
         {
             return Err(bad(
                 "metadata file requires short allocations and correct file type",
             ));
         }
         let header = if kind == 266 { 216usize } else { 176 };
-        if u64_at(descriptor, header - 16)? != 0
-            || u32_at(descriptor, if kind == 266 { 136 } else { 112 })? != 0
+        if u64_at(&descriptor, header - 16)? != 0
+            || u32_at(&descriptor, if kind == 266 { 136 } else { 112 })? != 0
             || (kind == 266
-                && (u32_at(descriptor, 152)? != 0
-                    || u64_at(descriptor, 64)? != u64_at(descriptor, 56)?))
+                && (u32_at(&descriptor, 152)? != 0
+                    || u64_at(&descriptor, 64)? != u64_at(&descriptor, 56)?))
         {
             return Err(bad("metadata file unique ID, attributes or streams"));
         }
-        let file_size = u64_at(descriptor, 56)?;
+        let file_size = u64_at(&descriptor, 56)?;
         let allocations_start = header
-            .checked_add(u32_at(descriptor, header - 8)? as usize)
+            .checked_add(u32_at(&descriptor, header - 8)? as usize)
             .ok_or_else(|| bad("metadata allocations overflow"))?;
-        let allocations_length = u32_at(descriptor, header - 4)? as usize;
+        let allocations_length = u32_at(&descriptor, header - 4)? as usize;
         let initial = descriptor
             .get(
                 allocations_start
@@ -528,7 +531,7 @@ fn translate(
     Ok(extents)
 }
 fn vat(
-    bytes: &[u8],
+    bytes: &dyn crate::source::ReadAt,
     start: u64,
     partition_size: u64,
     physical_reference: u16,
@@ -536,8 +539,8 @@ fn vat(
     budget: &mut u64,
 ) -> Result<Vec<u32>> {
     // The VAT ICB is the final recorded block. Search a bounded tail to accommodate padding.
-    let end = (start + partition_size).min(bytes.len() as u64) / BLOCK;
-    let disc_end = bytes.len() as u64 / BLOCK;
+    let end = (start + partition_size).min(bytes.len()) / BLOCK;
+    let disc_end = bytes.len() / BLOCK;
     let candidates = (disc_end.saturating_sub(512).max(start / BLOCK)..disc_end)
         .rev()
         .chain((end.saturating_sub(512).max(start / BLOCK)..end).rev());
@@ -548,26 +551,26 @@ fn vat(
         }
         charge(budget, BLOCK, limits)?;
         let descriptor = region(bytes, absolute * BLOCK, BLOCK)?;
-        let kind = u16_at(descriptor, 0)?;
+        let kind = u16_at(&descriptor, 0)?;
         if !matches!(kind, 261 | 266) || !matches!(descriptor[27], 0 | 248) {
             continue;
         }
         let location = u32::try_from(absolute - start / BLOCK).map_err(|_| bad("VAT location"))?;
-        if tag(descriptor, kind, location).is_err() {
+        if tag(&descriptor, kind, location).is_err() {
             continue;
         }
         let header = if kind == 266 { 216usize } else { 176 };
-        let allocation_type = u16_at(descriptor, 34)? & 7;
-        let size = u64_at(descriptor, 56)?;
+        let allocation_type = u16_at(&descriptor, 34)? & 7;
+        let size = u64_at(&descriptor, 56)?;
         charge(budget, size, limits)?;
         let begin = header
-            .checked_add(u32_at(descriptor, header - 8)? as usize)
+            .checked_add(u32_at(&descriptor, header - 8)? as usize)
             .ok_or_else(|| bad("VAT attributes"))?;
         let allocation = descriptor
             .get(
                 begin
                     ..begin
-                        .checked_add(u32_at(descriptor, header - 4)? as usize)
+                        .checked_add(u32_at(&descriptor, header - 4)? as usize)
                         .ok_or_else(|| bad("VAT allocations"))?,
             )
             .ok_or_else(|| bad("VAT allocation range"))?;
@@ -619,7 +622,7 @@ fn vat(
     Err(bad("VAT ICB not found in bounded recorded tail"))
 }
 fn sparing(
-    bytes: &[u8],
+    bytes: &dyn crate::source::ReadAt,
     map: &[u8],
     limits: Limits,
     budget: &mut u64,
@@ -634,26 +637,28 @@ fn sparing(
     for index in 0..copies {
         charge(budget, u64::from(size), limits)?;
         let location = u32_at(map, 48 + index * 4)?;
-        let Ok(table) = region(bytes, u64::from(location) * BLOCK, u64::from(size)) else {
-            continue;
+        let table = match region(bytes, u64::from(location) * BLOCK, u64::from(size)) {
+            Ok(table) => table,
+            Err(error @ Error::Io(_)) => return Err(error),
+            Err(_) => continue,
         };
-        if tag(table, 0, location).is_err() || &table[17..35] != b"*UDF Sparing Table" {
+        if tag(&table, 0, location).is_err() || &table[17..35] != b"*UDF Sparing Table" {
             continue;
         }
-        let count = usize::from(u16_at(table, 48)?);
-        if 56 + count * 8 > table.len() || 16 + usize::from(u16_at(table, 10)?) < 56 + count * 8 {
+        let count = usize::from(u16_at(&table, 48)?);
+        if 56 + count * 8 > table.len() || 16 + usize::from(u16_at(&table, 10)?) < 56 + count * 8 {
             continue;
         }
-        let sequence = u32_at(table, 52)?;
+        let sequence = u32_at(&table, 52)?;
         let mut entries = Vec::new();
         let mut replacements = std::collections::HashSet::new();
         for index in 0..count {
-            let original = u32_at(table, 56 + index * 8)?;
-            let mapped = u32_at(table, 60 + index * 8)?;
+            let original = u32_at(&table, 56 + index * 8)?;
+            let mapped = u32_at(&table, 60 + index * 8)?;
             if !replacements.insert(mapped) {
                 return Err(bad("duplicate sparing replacement"));
             }
-            region(bytes, u64::from(mapped) * BLOCK, u64::from(packet) * BLOCK)?;
+            super::check_region(bytes, u64::from(mapped) * BLOCK, u64::from(packet) * BLOCK)?;
             if original >= 0xfffffff0 {
                 continue;
             }

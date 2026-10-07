@@ -11,6 +11,7 @@ const BLOCK: usize = 2048;
 #[derive(Clone)]
 struct Node {
     path: PathBuf,
+    content: Option<crate::tree_source::DeferredContent>,
     name: Vec<u8>,
     joliet_name: Vec<u8>,
     parent: usize,
@@ -272,6 +273,11 @@ fn scan(
         };
         children.push(Node {
             path: entry.path(),
+            content: if kind.is_file() {
+                Some(crate::tree_source::host_file_content(entry.path())?)
+            } else {
+                None
+            },
             name,
             joliet_name,
             parent: index,
@@ -533,6 +539,7 @@ pub fn write_iso9660_with_options_and_progress(
     }
     let mut nodes = vec![Node {
         path: source.into(),
+        content: None,
         name: vec![0],
         joliet_name: vec![0],
         parent: 0,
@@ -548,6 +555,25 @@ pub fn write_iso9660_with_options_and_progress(
         rr_length: 0,
     }];
     scan(&mut nodes, 0, 1, 0, options)?;
+    emit_nodes(
+        source,
+        output,
+        options,
+        nodes,
+        &mut checkpoint,
+        &mut progress,
+        false,
+    )
+}
+fn emit_nodes(
+    source: &Path,
+    output: &Path,
+    options: &IsoOptions,
+    mut nodes: Vec<Node>,
+    checkpoint: &mut impl FnMut() -> Result<()>,
+    progress: &mut impl FnMut(u64, u64) -> Result<()>,
+    staged: bool,
+) -> Result<()> {
     checkpoint()?;
     let mut identities = HashMap::new();
     let mut serial = 0u32;
@@ -771,7 +797,11 @@ pub fn write_iso9660_with_options_and_progress(
         entry.validate(size)?;
         if entry.emulation == crate::BootEmulation::HardDisk {
             let mut mbr = [0; 512];
-            File::open(&node.path)?.read_exact(&mut mbr)?;
+            if let Some(content) = &node.content {
+                content.read_exact_at(0, &mut mbr)?;
+            } else {
+                File::open(&node.path)?.read_exact(&mut mbr)?;
+            }
             let partitions = mbr[446..510]
                 .chunks_exact(16)
                 .filter(|part| part[4] != 0)
@@ -823,6 +853,10 @@ pub fn write_iso9660_with_options_and_progress(
     }
     let total_bytes = u64::from(sector) * BLOCK as u64 + hybrid_tail.len() as u64;
     progress(0, total_bytes)?;
+    let parent = output
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
     let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
     temporary.write_all(&system_area)?;
     temporary.write_all(&primary)?;
@@ -880,12 +914,23 @@ pub fn write_iso9660_with_options_and_progress(
             progress(emitted, total_bytes)?;
             continue;
         }
-        let mut file = File::open(&node.path)?;
+        let mut file = if node.content.is_none() {
+            Some(File::open(&node.path)?)
+        } else {
+            None
+        };
         let mut copied = 0u64;
         let mut buffer = [0u8; 65536];
         loop {
             checkpoint()?;
-            let count = file.read(&mut buffer)?;
+            let count = if let Some(content) = &node.content {
+                let count = usize::try_from((node.size - copied).min(buffer.len() as u64))
+                    .map_err(|_| Error::ResourceLimit("payload buffer"))?;
+                content.read_exact_at(copied, &mut buffer[..count])?;
+                count
+            } else {
+                file.as_mut().expect("host payload").read(&mut buffer)?
+            };
             if count == 0 {
                 break;
             }
@@ -939,9 +984,21 @@ pub fn write_iso9660_with_options_and_progress(
     temporary.flush()?;
     temporary.as_file().sync_all()?;
     checkpoint()?;
-    temporary
-        .persist_noclobber(output)
-        .map_err(|error| Error::Io(error.error))?;
+    for node in &nodes {
+        checkpoint()?;
+        if let Some(content) = &node.content {
+            content.validate()?;
+        }
+    }
+    if staged {
+        temporary
+            .persist(output)
+            .map_err(|error| Error::Io(error.error))?;
+    } else {
+        temporary
+            .persist_noclobber(output)
+            .map_err(|error| Error::Io(error.error))?;
+    }
     Ok(())
 }
 
@@ -1114,4 +1171,231 @@ fn patch_boot(
         file.write_all(&table)?;
     }
     Ok(())
+}
+
+/// Stage a content-only ISO from a bounded deferred inventory. Sparse extents
+/// become logical zero bytes; named streams are rejected rather than discarded.
+#[allow(clippy::arc_with_non_send_sync)] // Shared ownership supports portable single-threaded reader sources.
+pub fn stage_iso9660_from_tree_source(
+    source: &impl crate::tree_source::FileTreeSource,
+    directory: &Path,
+    options: &IsoOptions,
+    mut checkpoint: impl FnMut() -> Result<()>,
+) -> Result<tempfile::TempPath> {
+    checkpoint()?;
+    options.validate()?;
+    let inventory = source.inventory(options.max_entries, options.max_metadata_bytes)?;
+    inventory.validate_budget(options.max_entries, options.max_metadata_bytes)?;
+    stage_inventory(inventory, directory, options, checkpoint)
+}
+#[allow(clippy::arc_with_non_send_sync)] // Retained portable reader ownership.
+fn stage_inventory(
+    inventory: crate::tree_source::TreeInventory,
+    directory: &Path,
+    options: &IsoOptions,
+    mut checkpoint: impl FnMut() -> Result<()>,
+) -> Result<tempfile::TempPath> {
+    use crate::tree_source::{DeferredContent, ExtentContent, TreeEntryKind};
+    use std::sync::Arc;
+    if !inventory.root_streams.is_empty() || !inventory.system_streams.is_empty() {
+        return Err(unsupported("ISO cannot preserve root or system streams"));
+    }
+    let unix = |directory: bool, link: bool| crate::rock_ridge::UnixMetadata {
+        mode: if directory {
+            0o040000 | options.unix_metadata.directory_mode
+        } else if link {
+            0o120777
+        } else {
+            0o100000 | options.unix_metadata.file_mode
+        },
+        links: 1,
+        uid: options.unix_metadata.uid,
+        gid: options.unix_metadata.gid,
+        serial: None,
+        device: None,
+        timestamps: Vec::new(),
+    };
+    let mut nodes = vec![Node {
+        path: PathBuf::new(),
+        content: None,
+        name: vec![0],
+        joliet_name: vec![0],
+        parent: 0,
+        directory: true,
+        size: 0,
+        sector: 0,
+        children: Vec::new(),
+        original: String::new(),
+        unix: unix(true, false),
+        link: None,
+        identity: None,
+        rr_offset: 0,
+        rr_length: 0,
+    }];
+    let mut entries = inventory.entries;
+    entries.sort_by(|a, b| {
+        a.path
+            .split('/')
+            .count()
+            .cmp(&b.path.split('/').count())
+            .then(a.path.cmp(&b.path))
+    });
+    let mut paths = HashMap::from([(String::new(), 0usize)]);
+    for entry in entries {
+        checkpoint()?;
+        if !entry.streams.is_empty() {
+            return Err(unsupported("ISO cannot preserve named streams"));
+        }
+        if entry.path.starts_with('/')
+            || entry
+                .path
+                .split('/')
+                .any(|part| part.is_empty() || part == "." || part == "..")
+        {
+            return Err(unsupported("invalid source path"));
+        }
+        let (parent_path, original) = entry.path.rsplit_once('/').unwrap_or(("", &entry.path));
+        let parent = *paths
+            .get(parent_path)
+            .ok_or_else(|| unsupported("missing source parent directory"))?;
+        if !nodes[parent].directory {
+            return Err(unsupported("source parent is not a directory"));
+        }
+        let (directory, link, content, identity) = match entry.kind {
+            TreeEntryKind::Directory => (true, None, None, None),
+            TreeEntryKind::Symlink(target) => {
+                if !options.rock_ridge {
+                    return Err(unsupported("symlinks require Rock Ridge"));
+                }
+                (false, Some(target), None, None)
+            }
+            TreeEntryKind::File(extents) => (
+                false,
+                None,
+                Some(DeferredContent::new(Arc::new(ExtentContent::new(
+                    entry.object,
+                    extents,
+                )?))),
+                Some(((entry.object >> 64) as u64, entry.object as u64)),
+            ),
+            TreeEntryKind::HardLink(target) => {
+                let index = *paths
+                    .get(&target)
+                    .ok_or_else(|| unsupported("hard-link target must precede alias"))?;
+                if nodes[index].directory || nodes[index].link.is_some() {
+                    return Err(unsupported("invalid hard-link target"));
+                }
+                (
+                    false,
+                    None,
+                    nodes[index].content.clone(),
+                    nodes[index].identity,
+                )
+            }
+        };
+        let size = content.as_ref().map_or(0, DeferredContent::len);
+        if options.level != IsoLevel::Level3 && size > u64::from(u32::MAX) {
+            return Err(unsupported("files larger than 4 GiB require ISO level 3"));
+        }
+        let name = if options.filename_policy == FilenamePolicy::Mangle {
+            mangle_for_level(original, directory, options.level)
+        } else {
+            identifier_for_level(original, directory, options.level)?
+        };
+        if entry.path.split('/').count() >= options.max_directory_depth
+            || entry.path.len() > options.max_path_bytes
+        {
+            return Err(unsupported("ISO path or depth limit exceeded"));
+        }
+        let joliet_name = if options.joliet {
+            joliet_identifier(original, options.joliet_max_name)?
+        } else {
+            Vec::new()
+        };
+        if nodes[parent].children.iter().any(|&index| {
+            nodes[index].name == name || options.joliet && nodes[index].joliet_name == joliet_name
+        }) {
+            return Err(unsupported("ISO destination name collision"));
+        }
+        let index = nodes.len();
+        nodes.push(Node {
+            path: PathBuf::from(&entry.path),
+            content,
+            name,
+            joliet_name,
+            parent,
+            directory,
+            size,
+            sector: 0,
+            children: Vec::new(),
+            original: original.into(),
+            unix: unix(directory, link.is_some()),
+            link,
+            identity,
+            rr_offset: 0,
+            rr_length: 0,
+        });
+        nodes[parent].children.push(index);
+        if paths.insert(entry.path, index).is_some() {
+            return Err(unsupported("duplicate source path"));
+        }
+    }
+    let (file, path) = tempfile::NamedTempFile::new_in(directory)?.into_parts();
+    drop(file);
+    emit_nodes(
+        Path::new(""),
+        &path,
+        options,
+        nodes,
+        &mut checkpoint,
+        &mut |_, _| Ok(()),
+        true,
+    )?;
+    Ok(path)
+}
+
+/// Stage after explicit metadata preflight, returning the transformation report.
+pub fn stage_iso9660_from_tree_source_with_policy(
+    source: &impl crate::tree_source::FileTreeSource,
+    directory: &Path,
+    options: &IsoOptions,
+    policy: crate::preservation::Policy,
+    mut checkpoint: impl FnMut() -> Result<()>,
+) -> Result<(tempfile::TempPath, crate::preservation::Report)> {
+    checkpoint()?;
+    options.validate()?;
+    let inventory = source.inventory(options.max_entries, options.max_metadata_bytes)?;
+    inventory.validate_budget(options.max_entries, options.max_metadata_bytes)?;
+    let profile = if options.rock_ridge {
+        crate::preservation::Profile::IsoRockRidge
+    } else if options.joliet {
+        crate::preservation::Profile::IsoJoliet
+    } else {
+        crate::preservation::Profile::IsoPrimary
+    };
+    let metadata = inventory
+        .entries
+        .iter()
+        .flat_map(|entry| {
+            std::iter::once(&entry.metadata)
+                .chain(entry.streams.iter().map(|stream| &stream.metadata))
+        })
+        .chain(
+            inventory
+                .root_streams
+                .iter()
+                .chain(&inventory.system_streams)
+                .map(|stream| &stream.metadata),
+        );
+    let report =
+        crate::preservation::preflight_iter(profile, policy, &inventory.root_metadata, metadata);
+    if !report.allowed() {
+        return Err(unsupported(
+            "preservation preflight rejected requested policy",
+        ));
+    }
+    Ok((
+        stage_inventory(inventory, directory, options, checkpoint)?,
+        report,
+    ))
 }

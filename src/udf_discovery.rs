@@ -5,9 +5,9 @@ const BLOCK: u64 = 2048;
 const MAX_SEQUENCE_BLOCKS: u32 = 256;
 const MAX_SEQUENCE_LINKS: usize = 64;
 
-pub(super) struct Descriptors<'a> {
-    pub partitions: Vec<&'a [u8]>,
-    pub logical: &'a [u8],
+pub(super) struct Descriptors {
+    pub partitions: Vec<Vec<u8>>,
+    pub logical: Vec<u8>,
 }
 fn protected(bytes: &[u8], minimum: usize) -> Result<()> {
     if 16 + usize::from(u16_at(bytes, 10)?) < minimum {
@@ -15,17 +15,17 @@ fn protected(bytes: &[u8], minimum: usize) -> Result<()> {
     }
     Ok(())
 }
-fn sequence<'a>(
-    bytes: &'a [u8],
+fn sequence(
+    bytes: &dyn crate::source::ReadAt,
     start: u32,
     length: u32,
     limits: Limits,
     budget: &mut u64,
-) -> Result<Descriptors<'a>> {
+) -> Result<Descriptors> {
     let mut extent = (start, length);
     let mut seen = HashSet::new();
-    let mut partitions = BTreeMap::<u16, (u32, &'a [u8])>::new();
-    let mut logical: Option<(u32, &'a [u8])> = None;
+    let mut partitions = BTreeMap::<u16, (u32, Vec<u8>)>::new();
+    let mut logical: Option<(u32, Vec<u8>)> = None;
     let mut total_blocks = 0u32;
     loop {
         if seen.len() >= MAX_SEQUENCE_LINKS || !seen.insert(extent) {
@@ -40,27 +40,27 @@ fn sequence<'a>(
         {
             return Err(bad("unbounded volume descriptor sequence"));
         }
-        region(bytes, u64::from(start) * BLOCK, u64::from(length))?;
+        super::check_region(bytes, u64::from(start) * BLOCK, u64::from(length))?;
         let mut next = None;
         let mut terminated = false;
         for index in 0..count {
             let location = start
                 .checked_add(index)
                 .ok_or_else(|| bad("volume descriptor location overflow"))?;
-            charge_metadata(budget, 16, limits)?;
+            charge_metadata(budget, BLOCK, limits)?;
             let descriptor = region(bytes, u64::from(location) * BLOCK, BLOCK)?;
-            let kind = u16_at(descriptor, 0)?;
-            tag(descriptor, kind, location)?;
+            let kind = u16_at(&descriptor, 0)?;
+            tag(&descriptor, kind, location)?;
             match kind {
                 3 => {
-                    protected(descriptor, 28)?;
-                    next = Some((u32_at(descriptor, 24)?, u32_at(descriptor, 20)?));
+                    protected(&descriptor, 28)?;
+                    next = Some((u32_at(&descriptor, 24)?, u32_at(&descriptor, 20)?));
                     break;
                 }
                 5 => {
-                    protected(descriptor, 196)?;
-                    let number = u16_at(descriptor, 22)?;
-                    let serial = u32_at(descriptor, 16)?;
+                    protected(&descriptor, 196)?;
+                    let number = u16_at(&descriptor, 22)?;
+                    let serial = u32_at(&descriptor, 16)?;
                     if let Some((previous, _)) = partitions.get(&number)
                         && serial < *previous
                     {
@@ -69,9 +69,12 @@ fn sequence<'a>(
                     partitions.insert(number, (serial, descriptor));
                 }
                 6 => {
-                    protected(descriptor, 20)?;
-                    let serial = u32_at(descriptor, 16)?;
-                    if logical.is_none_or(|(previous, _)| serial >= previous) {
+                    protected(&descriptor, 20)?;
+                    let serial = u32_at(&descriptor, 16)?;
+                    if logical
+                        .as_ref()
+                        .is_none_or(|(previous, _)| serial >= *previous)
+                    {
                         logical = Some((serial, descriptor));
                     }
                 }
@@ -107,12 +110,12 @@ fn sequence<'a>(
     })
 }
 
-pub(super) fn discover<'a>(
-    bytes: &'a [u8],
+pub(super) fn discover(
+    bytes: &dyn crate::source::ReadAt,
     limits: Limits,
     budget: &mut u64,
-) -> Result<Descriptors<'a>> {
-    let blocks = bytes.len() as u64 / BLOCK;
+) -> Result<Descriptors> {
+    let blocks = bytes.len() / BLOCK;
     let mut candidates = vec![256u64];
     if let Some(last) = blocks.checked_sub(1) {
         candidates.extend([last, last.saturating_sub(256)]);
@@ -125,6 +128,7 @@ pub(super) fn discover<'a>(
         }
         let anchor = match region(bytes, location * BLOCK, BLOCK) {
             Ok(anchor) => anchor,
+            Err(error @ Error::Io(_)) => return Err(error),
             Err(error) => {
                 last_error = Some(error);
                 continue;
@@ -134,19 +138,20 @@ pub(super) fn discover<'a>(
             Ok(value) => value,
             Err(_) => continue,
         };
-        if let Err(error) = tag(anchor, 2, logical_location).and_then(|()| protected(anchor, 32)) {
+        if let Err(error) = tag(&anchor, 2, logical_location).and_then(|()| protected(&anchor, 32))
+        {
             last_error = Some(error);
             continue;
         }
         for offset in [16, 24] {
-            let length = u32_at(anchor, offset)?;
-            let start = u32_at(anchor, offset + 4)?;
+            let length = u32_at(&anchor, offset)?;
+            let start = u32_at(&anchor, offset + 4)?;
             if length == 0 {
                 continue;
             }
             match sequence(bytes, start, length, limits, budget) {
                 Ok(descriptors) => return Ok(descriptors),
-                Err(error @ Error::ResourceLimit(_)) => return Err(error),
+                Err(error @ (Error::ResourceLimit(_) | Error::Io(_))) => return Err(error),
                 Err(error) => last_error = Some(error),
             }
         }

@@ -8,7 +8,7 @@ use std::{
     collections::BTreeMap,
     fs::{self, File},
     io::{Read, Seek, SeekFrom, Write},
-    path::{Component, Path, PathBuf},
+    path::{Component, Path},
     sync::Arc,
 };
 const BLOCK: u64 = 2048;
@@ -262,13 +262,12 @@ pub enum UdfFileExtent {
 }
 #[derive(Debug, Clone)]
 enum Piece {
-    Data(Arc<[u8]>),
+    Deferred(crate::tree_source::DeferredContent),
     Hole(u64),
     AllocatedHole(u64),
 }
 #[derive(Debug, Clone)]
 enum Payload {
-    File(PathBuf, u64),
     Pieces(Arc<[Piece]>),
     Link(Arc<str>),
     HardLink(String),
@@ -278,14 +277,14 @@ enum Payload {
 struct Input {
     payload: Payload,
     preallocated: u32,
-    streams: BTreeMap<String, Arc<[u8]>>,
+    streams: BTreeMap<String, Payload>,
 }
 /// An explicit image tree, including streams, links and sparse data.
 #[derive(Debug, Clone, Default)]
 pub struct UdfImage {
     entries: BTreeMap<String, Input>,
-    system_streams: BTreeMap<String, Arc<[u8]>>,
-    root_streams: BTreeMap<String, Arc<[u8]>>,
+    system_streams: BTreeMap<String, Payload>,
+    root_streams: BTreeMap<String, Payload>,
 }
 impl UdfImage {
     /// Create an empty image tree.
@@ -332,13 +331,22 @@ impl UdfImage {
         let source = source.as_ref().to_path_buf();
         let metadata = fs::symlink_metadata(&source)?;
         ensure!(metadata.is_file(), "source is not a regular file");
-        self.insert(path.as_ref(), Payload::File(source, metadata.len()))
+        self.insert(
+            path.as_ref(),
+            Payload::Pieces(Arc::from([Piece::Deferred(
+                crate::tree_source::host_file_content(source)?,
+            )])),
+        )
     }
     /// Add a regular file whose bytes are owned by the builder.
     pub fn add_bytes(&mut self, path: impl AsRef<str>, bytes: Vec<u8>) -> Result<()> {
         self.insert(
             path.as_ref(),
-            Payload::Pieces(Arc::from([Piece::Data(Arc::from(bytes))])),
+            Payload::Pieces(Arc::from([Piece::Deferred(
+                crate::tree_source::DeferredContent::new(Arc::new(
+                    crate::tree_source::BufferContent::new(0, bytes),
+                )),
+            )])),
         )
     }
     /// Add an empty directory (parents are created automatically).
@@ -365,7 +373,11 @@ impl UdfImage {
                 extents
                     .into_iter()
                     .map(|e| match e {
-                        UdfFileExtent::Data(b) => Piece::Data(Arc::from(b)),
+                        UdfFileExtent::Data(b) => {
+                            Piece::Deferred(crate::tree_source::DeferredContent::new(Arc::new(
+                                crate::tree_source::BufferContent::new(0, b),
+                            )))
+                        }
                         UdfFileExtent::Hole(n) => Piece::Hole(n),
                         UdfFileExtent::AllocatedHole(n) => Piece::AllocatedHole(n),
                     })
@@ -402,7 +414,14 @@ impl UdfImage {
                 !self.root_streams.contains_key(&name),
                 "duplicate root stream name"
             );
-            self.root_streams.insert(name, Arc::from(bytes));
+            self.root_streams.insert(
+                name,
+                Payload::Pieces(Arc::from([Piece::Deferred(
+                    crate::tree_source::DeferredContent::new(Arc::new(
+                        crate::tree_source::BufferContent::new(0, bytes),
+                    )),
+                )])),
+            );
             return Ok(());
         }
         let owner = normal_path(owner.as_ref())?;
@@ -415,7 +434,14 @@ impl UdfImage {
             "attach streams to the hard-link target"
         );
         ensure!(!entry.streams.contains_key(&name), "duplicate stream name");
-        entry.streams.insert(name, Arc::from(bytes));
+        entry.streams.insert(
+            name,
+            Payload::Pieces(Arc::from([Piece::Deferred(
+                crate::tree_source::DeferredContent::new(Arc::new(
+                    crate::tree_source::BufferContent::new(0, bytes),
+                )),
+            )])),
+        );
         Ok(())
     }
     /// Attach a named stream to the root directory.
@@ -431,7 +457,14 @@ impl UdfImage {
             !self.system_streams.contains_key(&name),
             "duplicate system stream"
         );
-        self.system_streams.insert(name, Arc::from(bytes));
+        self.system_streams.insert(
+            name,
+            Payload::Pieces(Arc::from([Piece::Deferred(
+                crate::tree_source::DeferredContent::new(Arc::new(
+                    crate::tree_source::BufferContent::new(0, bytes),
+                )),
+            )])),
+        );
         Ok(())
     }
     /// Allocate unrecorded blocks beyond a file's Information Length.
@@ -448,6 +481,132 @@ impl UdfImage {
         input.preallocated = blocks;
         Ok(())
     }
+    /// Preflight an explicit preservation policy before translating a source.
+    /// Faithful capture is gated when any native field cannot be emitted.
+    pub fn from_tree_source_with_policy(
+        source: &impl crate::tree_source::FileTreeSource,
+        maximum_entries: usize,
+        maximum_bytes: usize,
+        profile: crate::preservation::Profile,
+        policy: crate::preservation::Policy,
+    ) -> Result<(Self, crate::preservation::Report)> {
+        let inventory = source.inventory(maximum_entries, maximum_bytes)?;
+        inventory.validate_budget(maximum_entries, maximum_bytes)?;
+        let metadata = inventory
+            .entries
+            .iter()
+            .flat_map(|entry| {
+                std::iter::once(&entry.metadata)
+                    .chain(entry.streams.iter().map(|stream| &stream.metadata))
+            })
+            .chain(
+                inventory
+                    .root_streams
+                    .iter()
+                    .chain(&inventory.system_streams)
+                    .map(|stream| &stream.metadata),
+            );
+        let report = crate::preservation::preflight_iter(
+            profile,
+            policy,
+            &inventory.root_metadata,
+            metadata,
+        );
+        ensure!(
+            report.allowed(),
+            "preservation preflight rejected requested policy: {:?}",
+            report.issues
+        );
+        Ok((Self::from_inventory(inventory)?, report))
+    }
+    /// Translate a bounded, content-only source inventory without reading payloads.
+    pub fn from_tree_source(
+        source: &impl crate::tree_source::FileTreeSource,
+        maximum_entries: usize,
+        maximum_bytes: usize,
+    ) -> Result<Self> {
+        let inventory = source.inventory(maximum_entries, maximum_bytes)?;
+        inventory.validate_budget(maximum_entries, maximum_bytes)?;
+        Self::from_inventory(inventory)
+    }
+    fn from_inventory(inventory: crate::tree_source::TreeInventory) -> Result<Self> {
+        use crate::tree_source::{TreeEntryKind, TreeExtent};
+        let mut image = Self::new();
+        let stream_payload = |content| Payload::Pieces(Arc::from([Piece::Deferred(content)]));
+        let mut identities: BTreeMap<u128, String> = BTreeMap::new();
+        for entry in inventory.entries {
+            let payload = match entry.kind {
+                TreeEntryKind::Directory => Payload::Directory,
+                TreeEntryKind::Symlink(target) => Payload::Link(Arc::from(target)),
+                TreeEntryKind::HardLink(target) => Payload::HardLink(normal_path(&target)?),
+                TreeEntryKind::File(extents) => {
+                    if let Some(target) = identities.get(&entry.object) {
+                        ensure!(entry.streams.is_empty(), "hard-link alias carries streams");
+                        Payload::HardLink(target.clone())
+                    } else {
+                        identities.insert(entry.object, normal_path(&entry.path)?);
+                        Payload::Pieces(
+                            extents
+                                .into_iter()
+                                .map(|extent| match extent {
+                                    TreeExtent::Data(content) => Piece::Deferred(content),
+                                    TreeExtent::Hole(length) => Piece::Hole(length),
+                                    TreeExtent::AllocatedHole(length) => {
+                                        Piece::AllocatedHole(length)
+                                    }
+                                })
+                                .collect::<Vec<_>>()
+                                .into(),
+                        )
+                    }
+                }
+            };
+            image.insert(&entry.path, payload)?;
+            for stream in entry.streams {
+                component(&stream.name)?;
+                ensure!(!stream.name.starts_with("*UDF"), "reserved UDF stream name");
+                let owner = image
+                    .entries
+                    .get_mut(&normal_path(&entry.path)?)
+                    .context("stream owner missing")?;
+                ensure!(
+                    owner
+                        .streams
+                        .insert(stream.name, stream_payload(stream.content))
+                        .is_none(),
+                    "duplicate stream"
+                );
+            }
+        }
+        for (streams, destination) in [
+            (inventory.root_streams, &mut image.root_streams),
+            (inventory.system_streams, &mut image.system_streams),
+        ] {
+            for stream in streams {
+                component(&stream.name)?;
+                ensure!(!stream.name.starts_with("*UDF"), "reserved UDF stream name");
+                ensure!(
+                    destination
+                        .insert(stream.name, stream_payload(stream.content))
+                        .is_none(),
+                    "duplicate stream"
+                );
+            }
+        }
+        Ok(image)
+    }
+    /// Emit a closed, unpublished image for caller inspection before publication.
+    /// The returned temporary file is deleted on drop unless explicitly retained.
+    pub fn stage_with_cancel(
+        &self,
+        directory: &Path,
+        options: &UdfOptions,
+        mut checkpoint: impl FnMut() -> Result<()>,
+    ) -> Result<(tempfile::TempPath, String)> {
+        let (file, path) = tempfile::NamedTempFile::new_in(directory)?.into_parts();
+        drop(file);
+        write_image(self, &path, options, &mut checkpoint, true).map(|hash| (path, hash))
+    }
     /// Write an image and return its SHA-256 digest, refusing to overwrite output.
     pub fn write(&self, output: &Path, options: &UdfOptions) -> Result<String> {
         self.write_with_cancel(output, options, || Ok(()))
@@ -459,7 +618,7 @@ impl UdfImage {
         options: &UdfOptions,
         mut checkpoint: impl FnMut() -> Result<()>,
     ) -> Result<String> {
-        write_image(self, output, options, &mut checkpoint)
+        write_image(self, output, options, &mut checkpoint, false)
     }
 }
 /// Write a source directory with the default read-only UDF 1.02 profile.
@@ -822,10 +981,7 @@ fn build_nodes(image: &UdfImage, options: &UdfOptions) -> Result<(Vec<Node>, Opt
                 .get(target)
                 .context("hard link target does not exist")?;
             ensure!(
-                matches!(
-                    nodes[target].payload,
-                    Payload::File(..) | Payload::Pieces(_)
-                ),
+                matches!(nodes[target].payload, Payload::Pieces(_)),
                 "hard link target must be a regular file"
             );
             nodes[i].alias = Some(target);
@@ -842,12 +998,7 @@ fn build_nodes(image: &UdfImage, options: &UdfOptions) -> Result<(Vec<Node>, Opt
             nodes[owner].stream_dir = Some(idx);
             for (name, bytes) in &input.streams {
                 let child = nodes.len();
-                nodes.push(node(
-                    String::new(),
-                    compressed(name)?,
-                    idx,
-                    Payload::Pieces(Arc::from([Piece::Data(Arc::clone(bytes))])),
-                ));
+                nodes.push(node(String::new(), compressed(name)?, idx, bytes.clone()));
                 nodes[child].stream_owner = Some(owner);
                 nodes[idx].children.push(child);
             }
@@ -862,12 +1013,7 @@ fn build_nodes(image: &UdfImage, options: &UdfOptions) -> Result<(Vec<Node>, Opt
         nodes[0].stream_dir = Some(index);
         for (name, bytes) in &image.root_streams {
             let child = nodes.len();
-            let mut entry = node(
-                String::new(),
-                compressed(name)?,
-                index,
-                Payload::Pieces(Arc::from([Piece::Data(Arc::clone(bytes))])),
-            );
+            let mut entry = node(String::new(), compressed(name)?, index, bytes.clone());
             entry.stream_owner = Some(0);
             nodes.push(entry);
             nodes[index].children.push(child);
@@ -883,12 +1029,7 @@ fn build_nodes(image: &UdfImage, options: &UdfOptions) -> Result<(Vec<Node>, Opt
         nodes.push(n);
         for (name, bytes) in &image.system_streams {
             let child = nodes.len();
-            nodes.push(node(
-                String::new(),
-                compressed(name)?,
-                idx,
-                Payload::Pieces(Arc::from([Piece::Data(Arc::clone(bytes))])),
-            ));
+            nodes.push(node(String::new(), compressed(name)?, idx, bytes.clone()));
             nodes[child].system_stream = true;
             nodes[idx].children.push(child);
         }
@@ -990,10 +1131,9 @@ fn add_extent(
 }
 fn payload_size(payload: &Payload) -> Result<u64> {
     match payload {
-        Payload::File(_, size) => Ok(*size),
         Payload::Pieces(pieces) => pieces.iter().try_fold(0u64, |sum, p| {
             sum.checked_add(match p {
-                Piece::Data(b) => b.len() as u64,
+                Piece::Deferred(content) => content.len(),
                 Piece::Hole(n) | Piece::AllocatedHole(n) => *n,
             })
             .context("file size overflow")
@@ -1005,15 +1145,14 @@ fn payload_size(payload: &Payload) -> Result<u64> {
 fn small_payload(payload: &Payload, size: u64) -> Result<Vec<u8>> {
     let mut result = Vec::with_capacity(usize::try_from(size)?);
     match payload {
-        Payload::File(path, _) => {
-            let f = File::open(path)?;
-            f.take(size + 1).read_to_end(&mut result)?;
-            ensure!(result.len() as u64 == size, "source file changed");
-        }
         Payload::Pieces(pieces) => {
             for p in pieces.iter() {
                 match p {
-                    Piece::Data(b) => result.extend_from_slice(b),
+                    Piece::Deferred(content) => {
+                        let start = result.len();
+                        result.resize(start + usize::try_from(content.len())?, 0);
+                        content.read_exact_at(0, &mut result[start..])?;
+                    }
                     Piece::Hole(n) | Piece::AllocatedHole(n) => {
                         result.resize(result.len() + usize::try_from(*n)?, 0)
                     }
@@ -1293,35 +1432,25 @@ fn write_payload(
 ) -> Result<()> {
     output.seek(SeekFrom::Start(u64::from(physical) * BLOCK))?;
     match &node.payload {
-        Payload::File(path, size) => {
-            let mut input = File::open(path)?;
-            let mut remain = *size;
-            let mut buffer = [0; 65536];
-            while remain > 0 {
-                checkpoint()?;
-                let count = usize::try_from(remain.min(buffer.len() as u64))?;
-                input
-                    .read_exact(&mut buffer[..count])
-                    .with_context(|| format!("source changed while copying {}", path.display()))?;
-                output.write_all(&buffer[..count])?;
-                remain -= count as u64;
-            }
-            ensure!(
-                input.metadata()?.len() == *size,
-                "source changed during UDF write"
-            );
-        }
         Payload::Pieces(pieces) => {
             let mut position = u64::from(physical) * BLOCK;
             for p in pieces.iter() {
-                if let Piece::Data(bytes) = p {
+                if let Piece::Deferred(content) = p {
+                    let mut copied = 0;
+                    let mut buffer = [0; 65536];
                     output.seek(SeekFrom::Start(position))?;
-                    for chunk in bytes.chunks(65536) {
+                    content.validate()?;
+                    while copied < content.len() {
                         checkpoint()?;
-                        output.write_all(chunk)?;
+                        let count =
+                            usize::try_from((content.len() - copied).min(buffer.len() as u64))?;
+                        content.read_exact_at(copied, &mut buffer[..count])?;
+                        output.write_all(&buffer[..count])?;
+                        copied += count as u64;
                     }
+                    content.validate()?;
                     position = position
-                        .checked_add(u64::from(blocks(bytes.len() as u64)?) * BLOCK)
+                        .checked_add(u64::from(blocks(content.len())?) * BLOCK)
                         .context("payload offset overflow")?;
                 } else if let Piece::AllocatedHole(length) = p {
                     position = position
@@ -1393,10 +1522,11 @@ fn write_image(
     output: &Path,
     options: &UdfOptions,
     checkpoint: &mut impl FnMut() -> Result<()>,
+    staged: bool,
 ) -> Result<String> {
     checkpoint()?;
     options.validate()?;
-    ensure!(!output.exists(), "output already exists");
+    ensure!(staged || !output.exists(), "output already exists");
     let parent = output
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -1449,8 +1579,7 @@ fn write_image(
         let size = payload_size(&nodes[target].payload)?;
         boot.validate(u32::try_from(size).context("boot image exceeds 32-bit byte length")?)?;
         ensure!(
-            matches!(nodes[target].payload, Payload::File(..))
-                || matches!(&nodes[target].payload, Payload::Pieces(pieces) if pieces.iter().all(|piece|matches!(piece,Piece::Data(_)))),
+            matches!(&nodes[target].payload, Payload::Pieces(pieces) if pieces.iter().all(|piece|matches!(piece,Piece::Deferred(_)))),
             "boot image must be a recorded regular file"
         );
         boot_nodes.push(target);
@@ -1554,8 +1683,7 @@ fn write_image(
         let boot = boot_nodes.contains(&index);
         if boot {
             ensure!(
-                matches!(node.payload, Payload::File(..))
-                    || matches!(&node.payload,Payload::Pieces(p) if p.iter().all(|p|matches!(p,Piece::Data(_)))),
+                matches!(&node.payload,Payload::Pieces(p) if p.iter().all(|p|matches!(p,Piece::Deferred(_)))),
                 "boot image must be recorded and contiguous"
             );
         }
@@ -1563,7 +1691,7 @@ fn write_image(
             && size <= (2048 - header) as u64
             && node.preallocated == 0
             && !boot
-            && !matches!(&node.payload, Payload::Pieces(pieces) if pieces.iter().any(|piece|!matches!(piece,Piece::Data(_))));
+            && !matches!(&node.payload, Payload::Pieces(pieces) if pieces.iter().any(|piece|!matches!(piece,Piece::Deferred(_))));
         if can_embed {
             node.mode = AllocationMode::Embedded;
             node.embedded = small_payload(&node.payload, size)?;
@@ -1588,18 +1716,6 @@ fn write_image(
         };
         node.data = physical_cursor;
         match node.payload.clone() {
-            Payload::File(_, size) => {
-                let start = take(&mut physical_cursor, blocks(size)?)?;
-                add_extent(
-                    &mut node.allocations,
-                    0,
-                    size,
-                    start,
-                    0,
-                    options,
-                    &mut metadata,
-                )?;
-            }
             Payload::Link(target) => {
                 let size = link_bytes(&target)?.len() as u64;
                 let start = take(&mut physical_cursor, blocks(size)?)?;
@@ -1617,13 +1733,13 @@ fn write_image(
                 let nonempty: Vec<_> = pieces
                     .iter()
                     .filter(|p| match p {
-                        Piece::Data(b) => !b.is_empty(),
+                        Piece::Deferred(content) => !content.is_empty(),
                         Piece::Hole(n) | Piece::AllocatedHole(n) => *n > 0,
                     })
                     .collect();
                 for (index, p) in nonempty.iter().enumerate() {
                     let (kind, length) = match p {
-                        Piece::Data(b) => (0, b.len() as u64),
+                        Piece::Deferred(content) => (0, content.len()),
                         Piece::Hole(n) => (2, *n),
                         Piece::AllocatedHole(n) => (1, *n),
                     };
@@ -2106,6 +2222,22 @@ fn write_image(
     let hash = hex::encode(digest.finalize());
     drop(file);
     checkpoint()?;
-    fs::hard_link(&temp, output).context("publish UDF image without overwriting output")?;
+    // A source copied early may drift while later payloads or hashing run.
+    // Revalidate every retained snapshot before retaining or publishing output.
+    for node in &nodes {
+        checkpoint()?;
+        if let Payload::Pieces(pieces) = &node.payload {
+            for piece in pieces.iter() {
+                if let Piece::Deferred(content) = piece {
+                    content.validate()?;
+                }
+            }
+        }
+    }
+    if staged {
+        fs::rename(&temp, output).context("retain staged UDF image")?;
+    } else {
+        fs::hard_link(&temp, output).context("publish UDF image without overwriting output")?;
+    }
     Ok(hash)
 }

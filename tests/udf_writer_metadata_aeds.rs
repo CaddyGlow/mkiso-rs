@@ -28,6 +28,7 @@ fn large_fragmented_metadata_files_use_aed_chains_and_recover_from_mirrors() {
     // starts at block 64 and carries the first allocation-extent descriptor.
     let aed = (320 + 64) * block;
     assert_eq!(&bytes[aed..aed + 2], &258u16.to_le_bytes());
+    drop(reader);
     bytes[aed + 8] ^= 1;
     assert_eq!(
         UdfReader::open(&bytes, Limits::default())

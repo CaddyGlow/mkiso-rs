@@ -4,8 +4,13 @@
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub mod iso9660;
+pub mod iso_tree_source;
+pub mod preservation;
 pub mod rock_ridge;
+pub mod source;
+pub mod tree_source;
 pub mod udf;
+pub use source::{BoundedSource, ReadAt, SliceSource, SourceCursor};
 
 // Format-prefixed names keep both reader APIs usable in the same consumer.
 pub use iso9660::{
@@ -38,7 +43,8 @@ pub use iso_options::{
 };
 #[cfg(feature = "native-writer")]
 pub use iso9660_writer::{
-    write_iso9660, write_iso9660_with_options, write_iso9660_with_options_and_cancel,
+    stage_iso9660_from_tree_source, stage_iso9660_from_tree_source_with_policy, write_iso9660,
+    write_iso9660_with_options, write_iso9660_with_options_and_cancel,
     write_iso9660_with_options_and_progress,
 };
 
@@ -59,3 +65,5 @@ pub use writer::{write_iso, write_iso_with_cancel, write_iso_with_hash};
 /// Media planning and orchestration used by the optional mkiso CLI.
 #[cfg(feature = "cli")]
 pub mod boot_media;
+
+pub mod udf_tree;

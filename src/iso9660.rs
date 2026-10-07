@@ -102,6 +102,8 @@ pub struct Index {
 pub struct IsoReader<R> {
     reader: R,
     index: Index,
+    root_metadata: crate::preservation::Metadata,
+    metadata: Vec<crate::preservation::Metadata>,
 }
 
 impl<R: Read + Seek> IsoReader<R> {
@@ -118,8 +120,13 @@ impl<R: Read + Seek> IsoReader<R> {
 
     /// Read a selected namespace with bounded metadata traversal.
     pub fn open_with_options(mut reader: R, options: ReadOptions) -> Result<Self> {
-        let index = read_index_with_options(&mut reader, options)?;
-        Ok(Self { reader, index })
+        let (index, root_metadata, metadata) = read_index_inspected(&mut reader, options)?;
+        Ok(Self {
+            reader,
+            index,
+            root_metadata,
+            metadata,
+        })
     }
 
     /// Listed files and directories in traversal order.
@@ -132,10 +139,32 @@ impl<R: Read + Seek> IsoReader<R> {
         &self.index
     }
 
+    /// Native root fields inspected in the selected namespace.
+    pub fn root_metadata(&self) -> &crate::preservation::Metadata {
+        &self.root_metadata
+    }
+
+    /// Native entry fields inspected in the selected namespace.
+    pub fn metadata(&self, index: usize) -> Option<&crate::preservation::Metadata> {
+        self.metadata.get(index)
+    }
+
     /// Return the underlying reader and validated index without reparsing the image.
     /// The reader's current seek position is unspecified.
     pub fn into_parts(self) -> (R, Index) {
         (self.reader, self.index)
+    }
+
+    /// Return retained input, index and inspected metadata without reparsing.
+    pub fn into_inspected_parts(
+        self,
+    ) -> (
+        R,
+        Index,
+        crate::preservation::Metadata,
+        Vec<crate::preservation::Metadata>,
+    ) {
+        (self.reader, self.index, self.root_metadata, self.metadata)
     }
 
     /// Read one payload into memory with an explicit maximum allocation size.
@@ -271,6 +300,17 @@ pub fn read_index_with_options<R: Read + Seek>(
     reader: &mut R,
     options: ReadOptions,
 ) -> Result<Index> {
+    read_index_inspected(reader, options).map(|(index, _, _)| index)
+}
+
+fn read_index_inspected<R: Read + Seek>(
+    reader: &mut R,
+    options: ReadOptions,
+) -> Result<(
+    Index,
+    crate::preservation::Metadata,
+    Vec<crate::preservation::Metadata>,
+)> {
     let limits = options.limits;
     let input_size = reader.seek(SeekFrom::End(0))?;
     let mut primary = None;
@@ -305,6 +345,7 @@ pub fn read_index_with_options<R: Read + Seek>(
     }
     let primary = primary.ok_or_else(|| malformed("missing ISO primary descriptor"))?;
     let mut rr_skip = None;
+    let mut root_unix = None;
     let mut rr_metadata = 0;
     if matches!(
         options.namespace,
@@ -343,6 +384,7 @@ pub fn read_index_with_options<R: Read + Seek>(
             )?;
             if attributes.rrip {
                 rr_skip = Some(skip);
+                root_unix = attributes.metadata;
             }
         }
         if options.namespace == Namespace::RockRidge && rr_skip.is_none() {
@@ -387,13 +429,33 @@ pub fn read_index_with_options<R: Read + Seek>(
     if !root.directory || root.name != [0] {
         return Err(malformed("invalid ISO root"));
     }
+    let root_entry = Entry {
+        raw_name: vec![0],
+        name: String::new(),
+        directory: true,
+        size: 0,
+        unix: root_unix,
+        link_target: None,
+    };
+    let root_inspection_bytes = inspected_metadata_bytes(&root_entry)?;
+    let inspection_bytes = root_inspection_bytes;
+    if rr_metadata
+        .checked_add(inspection_bytes)
+        .is_none_or(|bytes| bytes > limits.max_metadata_bytes)
+    {
+        return Err(Error::ResourceLimit("ISO inspected metadata bytes"));
+    }
+    let root_metadata = inspected_metadata(&root_entry, &primary[174..181], use_rr);
+    let mut entry_metadata = Vec::new();
     let mut queue = VecDeque::from([(String::new(), root.extent, root.size, 0usize)]);
     let mut visited = HashSet::new();
     let mut entries = Vec::new();
     let mut offsets = Vec::new();
     let mut extents: Vec<Vec<Extent>> = Vec::new();
     let mut metadata_bytes = 0u64;
-    let mut directory_bytes = rr_metadata;
+    let mut directory_bytes = rr_metadata
+        .checked_add(inspection_bytes)
+        .ok_or(Error::ResourceLimit("ISO inspected metadata bytes"))?;
     while let Some((parent, extent, size, depth)) = queue.pop_front() {
         if depth > limits.max_nesting_depth {
             return Err(Error::ResourceLimit("ISO directory depth"));
@@ -543,6 +605,19 @@ pub fn read_index_with_options<R: Read + Seek>(
                     unix: attributes.metadata,
                     link_target: attributes.link,
                 });
+                let inspection_charge =
+                    inspected_metadata_bytes(entries.last().expect("entry just inserted"))?;
+                directory_bytes = directory_bytes
+                    .checked_add(inspection_charge)
+                    .ok_or(Error::ResourceLimit("ISO inspected metadata bytes"))?;
+                if directory_bytes > limits.max_metadata_bytes {
+                    return Err(Error::ResourceLimit("ISO inspected metadata bytes"));
+                }
+                entry_metadata.push(inspected_metadata(
+                    entries.last().expect("entry just inserted"),
+                    &stored[18..25],
+                    use_rr,
+                ));
                 offsets.push(child.extent);
                 extents.push(if child.directory {
                     Vec::new()
@@ -563,11 +638,69 @@ pub fn read_index_with_options<R: Read + Seek>(
             return Err(malformed("unfinished ISO multi-extent file"));
         }
     }
-    Ok(Index {
-        entries,
-        offsets,
-        extents,
-    })
+    Ok((
+        Index {
+            entries,
+            offsets,
+            extents,
+        },
+        root_metadata,
+        entry_metadata,
+    ))
+}
+
+fn inspected_metadata_bytes(entry: &Entry) -> Result<u64> {
+    let mut bytes = entry.raw_name.len() as u64;
+    let stamps = entry
+        .unix
+        .as_ref()
+        .map(|unix| unix.timestamps.as_slice())
+        .unwrap_or(&[]);
+    if stamps.is_empty() {
+        bytes = bytes
+            .checked_add(
+                7 + std::mem::size_of::<(u8, crate::preservation::NativeTimestamp)>() as u64,
+            )
+            .ok_or(Error::ResourceLimit("ISO inspected metadata bytes"))?;
+    } else {
+        for (_, stamp) in stamps {
+            bytes = bytes
+                .checked_add(stamp.len() as u64)
+                .and_then(|bytes| {
+                    bytes.checked_add(
+                        std::mem::size_of::<(u8, crate::preservation::NativeTimestamp)>() as u64,
+                    )
+                })
+                .ok_or(Error::ResourceLimit("ISO inspected metadata bytes"))?;
+        }
+    }
+    bytes
+        .checked_add(std::mem::size_of::<crate::preservation::Metadata>() as u64)
+        .ok_or(Error::ResourceLimit("ISO inspected metadata bytes"))
+}
+
+fn inspected_metadata(
+    entry: &Entry,
+    timestamp: &[u8],
+    rock_ridge: bool,
+) -> crate::preservation::Metadata {
+    use crate::preservation::{Field, NativeTimestamp, TimestampEncoding, TimestampPrecision};
+    let mut metadata = crate::preservation::Metadata::from_iso(entry);
+    if !matches!(&metadata.timestamps, Field::Present(values) if !values.is_empty()) {
+        metadata.timestamps = Field::Present(vec![(
+            2,
+            NativeTimestamp {
+                encoding: TimestampEncoding::IsoShort,
+                bytes: timestamp.to_vec(),
+                precision: TimestampPrecision::Seconds,
+            },
+        )]);
+    }
+    if rock_ridge && entry.unix.is_none() {
+        metadata.ownership = Field::Absent;
+        metadata.permissions = Field::Absent;
+    }
+    metadata
 }
 
 #[cfg(test)]

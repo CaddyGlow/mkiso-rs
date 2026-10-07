@@ -217,3 +217,48 @@ fn inconsistent_extended_object_sizes_are_rejected() {
         assert!(UdfReader::open(&image, Limits::default()).is_err());
     }
 }
+
+#[test]
+fn independent_fe_and_efe_metadata_keep_native_fields_across_revisions() {
+    use libmkiso::preservation::{Field, TimestampEncoding};
+    for revision in [0x102, 0x150, 0x200, 0x201, 0x250, 0x260] {
+        for extended in [false, true] {
+            let mut bytes = fixture(revision, extended, true);
+            let descriptor = &mut bytes[(PARTITION + 2) * BLOCK..(PARTITION + 3) * BLOCK];
+            put32(descriptor, 36, 123);
+            put32(descriptor, 40, 456);
+            put32(descriptor, 44, 0x4321);
+            let offsets: &[usize] = if extended {
+                &[80, 92, 104, 116]
+            } else {
+                &[72, 84, 96]
+            };
+            let stamp = [0x3c, 0x10, 0xea, 0x07, 10, 7, 12, 34, 56, 78, 90, 12];
+            for &offset in offsets {
+                descriptor[offset..offset + 12].copy_from_slice(&stamp);
+            }
+            seal(
+                descriptor,
+                if extended { 266 } else { 261 },
+                2,
+                if extended { 223 } else { 183 },
+                if revision >= 0x200 { 3 } else { 2 },
+            );
+            let reader = UdfReader::open(&bytes, Limits::default()).unwrap();
+            let metadata = reader.metadata(0).unwrap();
+            assert_eq!(metadata.ownership, Field::Present((123, 456)));
+            assert_eq!(metadata.permissions, Field::Present(0x4321));
+            let Field::Present(timestamps) = &metadata.timestamps else {
+                panic!("timestamps not inspected")
+            };
+            assert_eq!(timestamps.len(), offsets.len());
+            assert!(
+                timestamps
+                    .iter()
+                    .all(|(_, timestamp)| timestamp.bytes == stamp
+                        && timestamp.encoding == TimestampEncoding::Udf)
+            );
+            assert_eq!(timestamps.iter().any(|(kind, _)| *kind == 1), extended);
+        }
+    }
+}

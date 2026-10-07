@@ -116,6 +116,7 @@ fn fragmented_metadata_maps_cross_extent_boundaries_and_recover_duplicate_mirror
                     | UdfPartition::MetadataSparable { mirror: true, .. }
             ) {
                 // FSD is the first logical metadata block, at primary physical block 32.
+                drop(reader);
                 bytes[(320 + 32) * 2048 + 112] ^= 1;
                 let reader = UdfReader::open(&bytes, Limits::default()).unwrap();
                 let file = reader

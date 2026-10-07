@@ -17,6 +17,7 @@ const MAX_EXTENT: u64 = 0x3ffff800;
 #[derive(Debug)]
 struct Node {
     path: PathBuf,
+    content: Option<crate::tree_source::DeferredContent>,
     name: Vec<u8>,
     parent: usize,
     children: Vec<usize>,
@@ -107,6 +108,7 @@ fn name(path: &Path) -> Result<Vec<u8>> {
 fn scan(root: &Path, checkpoint: &mut impl FnMut() -> Result<()>) -> Result<Vec<Node>> {
     let mut ns = vec![Node {
         path: root.to_owned(),
+        content: None,
         name: vec![],
         parent: 0,
         children: vec![],
@@ -133,6 +135,11 @@ fn scan(root: &Path, checkpoint: &mut impl FnMut() -> Result<()>) -> Result<Vec<
                 let idx = ns.len();
                 let n = name(&path)?;
                 ns.push(Node {
+                    content: if m.is_file() {
+                        Some(crate::tree_source::host_file_content(&path)?)
+                    } else {
+                        None
+                    },
                     path,
                     name: n,
                     parent: i,
@@ -585,21 +592,26 @@ pub fn write_iso_with_cancel(
                 sector(&mut f, PART + n.data, &directory(&ns, i))?;
             } else {
                 f.seek(SeekFrom::Start(u64::from(PART + n.data) * BLOCK))?;
-                let mut input = File::open(&n.path)?;
+                let input = n
+                    .content
+                    .as_ref()
+                    .context("missing deferred source content")?;
                 let mut copied = 0;
                 let mut buffer = [0u8; 65536];
                 while copied < n.size {
                     checkpoint()?;
                     let count = (n.size - copied).min(buffer.len() as u64) as usize;
-                    let read = input.read(&mut buffer[..count])?;
+                    input.read_exact_at(copied, &mut buffer[..count])?;
+                    let read = count;
                     if read == 0 {
                         break;
                     }
                     f.write_all(&buffer[..read])?;
                     copied += read as u64;
                 }
+                input.validate()?;
                 ensure!(
-                    copied == n.size && input.metadata()?.len() == n.size,
+                    copied == n.size,
                     "source changed during ISO write: {}",
                     n.path.display()
                 );
@@ -634,6 +646,12 @@ pub fn write_iso_with_cancel(
         let hash = hex::encode(digest.finalize());
         drop(f);
         checkpoint()?;
+        for node in &ns {
+            checkpoint()?;
+            if let Some(content) = &node.content {
+                content.validate()?;
+            }
+        }
         fs::hard_link(&temp, output)
             .context("publish ISO without overwriting an existing output")?;
 
@@ -760,6 +778,7 @@ mod tests {
     fn allocation_supports_larger_than_four_gib() {
         let n = Node {
             path: PathBuf::new(),
+            content: None,
             name: vec![],
             parent: 0,
             children: vec![],

@@ -114,16 +114,20 @@ use std::{
 fn bad(message: &str) -> Error {
     Error::Malformed(format!("UDF: {message}"))
 }
-fn region(bytes: &[u8], start: u64, length: u64) -> Result<&[u8]> {
-    let end = start
+fn check_region(bytes: &dyn crate::source::ReadAt, start: u64, length: u64) -> Result<()> {
+    if start
         .checked_add(length)
-        .ok_or_else(|| bad("range overflow"))?;
-    bytes
-        .get(
-            usize::try_from(start).map_err(|_| bad("range conversion"))?
-                ..usize::try_from(end).map_err(|_| bad("range conversion"))?,
-        )
-        .ok_or_else(|| bad("range outside input"))
+        .is_none_or(|end| end > bytes.len())
+    {
+        return Err(bad("range outside input or overflow"));
+    }
+    Ok(())
+}
+fn region(bytes: &dyn crate::source::ReadAt, start: u64, length: u64) -> Result<Vec<u8>> {
+    check_region(bytes, start, length)?;
+    let mut data = vec![0; usize::try_from(length).map_err(|_| bad("range conversion"))?];
+    bytes.read_exact_at(start, &mut data)?;
+    Ok(data)
 }
 fn u16_at(bytes: &[u8], offset: usize) -> Result<u16> {
     let b = bytes
@@ -252,7 +256,11 @@ fn charge_metadata(budget: &mut u64, amount: u64, limits: Limits) -> Result<()> 
     Ok(())
 }
 
-fn copy_recorded(bytes: &[u8], extents: &[Extent], output: &mut [u8]) -> Result<()> {
+fn copy_recorded(
+    bytes: &dyn crate::source::ReadAt,
+    extents: &[Extent],
+    output: &mut [u8],
+) -> Result<()> {
     let mut cursor = 0usize;
     for extent in extents {
         let offset = extent
@@ -264,8 +272,8 @@ fn copy_recorded(bytes: &[u8], extents: &[Extent], output: &mut [u8]) -> Result<
             .ok_or_else(|| bad("resolved size overflow"))?;
         output
             .get_mut(cursor..end)
-            .ok_or_else(|| bad("resolved metadata size mismatch"))?
-            .copy_from_slice(region(bytes, offset, extent.length)?);
+            .ok_or_else(|| bad("resolved metadata size mismatch"))?;
+        bytes.read_exact_at(offset, &mut output[cursor..end])?;
         cursor = end;
     }
     if cursor != output.len() {
@@ -281,7 +289,7 @@ struct TaggedBlock {
 }
 
 fn tagged_block(
-    bytes: &[u8],
+    bytes: &dyn crate::source::ReadAt,
     maps: &partition::VolumeMap,
     reference: u16,
     location: u32,
@@ -306,6 +314,7 @@ fn tagged_block(
         .and_then(|extents| read(extents, false));
     match primary {
         Ok(descriptor) => Ok(descriptor),
+        Err(error @ Error::Io(_)) => Err(error),
         Err(error) => {
             if let Some(extents) = maps.resolve_mirror(reference, location, 2048)? {
                 read(extents, true)
@@ -348,7 +357,7 @@ fn validate_directory_tags(data: &[u8], extents: &[Extent]) -> Result<()> {
     reason = "validated allocation context and budgets stay explicit"
 )]
 fn decode_allocations(
-    bytes: &[u8],
+    bytes: &dyn crate::source::ReadAt,
     maps: &partition::VolumeMap,
     allocations: &[u8],
     allocation_type: u16,
@@ -421,7 +430,7 @@ fn decode_link(data: &[u8]) -> Result<String> {
 }
 
 fn resolve_icb(
-    bytes: &[u8],
+    bytes: &dyn crate::source::ReadAt,
     maps: &partition::VolumeMap,
     mut reference: u16,
     mut location: u32,
@@ -487,10 +496,71 @@ fn resolve_icb(
     }
 }
 
+/// Shared positional read limits across discovery and all deferred operations.
+#[derive(Clone)]
+pub struct SourceLimits {
+    /// Cumulative bytes requested from the source, including repeated reads.
+    pub max_read_bytes: u64,
+    /// Largest source read request and extraction scratch allocation.
+    pub max_scratch_bytes: usize,
+    /// Shared cooperative cancellation flag, checked before every source read.
+    pub cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+impl Default for SourceLimits {
+    fn default() -> Self {
+        Self {
+            max_read_bytes: u64::MAX,
+            max_scratch_bytes: 64 * 1024,
+            cancelled: Default::default(),
+        }
+    }
+}
+struct ControlledSource<S> {
+    source: S,
+    limits: SourceLimits,
+    used: std::rc::Rc<std::cell::Cell<u64>>,
+}
+impl<S: crate::source::ReadAt> crate::source::ReadAt for ControlledSource<S> {
+    fn len(&self) -> u64 {
+        self.source.len()
+    }
+    fn read_at(&self, offset: u64, buffer: &mut [u8]) -> std::io::Result<usize> {
+        use std::io::{Error, ErrorKind};
+        if self
+            .limits
+            .cancelled
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(Error::new(ErrorKind::Interrupted, "UDF source cancelled"));
+        }
+        let next = self
+            .used
+            .get()
+            .checked_add(buffer.len().min(self.limits.max_scratch_bytes) as u64)
+            .ok_or_else(|| Error::other("UDF read budget exceeded"))?;
+        if next > self.limits.max_read_bytes {
+            return Err(Error::other("UDF read budget exceeded"));
+        }
+        self.used.set(next);
+        // Chunk requests without allocating scratch or imposing a metadata size limit.
+        let count = buffer.len().min(self.limits.max_scratch_bytes);
+        if count == 0 && !buffer.is_empty() {
+            return Err(Error::other("UDF scratch budget is zero"));
+        }
+        self.source.read_at(offset, &mut buffer[..count])
+    }
+}
+
 /// Bounded UDF reader over caller-owned bytes.
 pub struct UdfReader<'a> {
-    bytes: &'a [u8],
+    bytes: Box<dyn crate::source::ReadAt + 'a>,
     entries: Vec<Entry>,
+    metadata_bytes: u64,
+    read_bytes: std::rc::Rc<std::cell::Cell<u64>>,
+    scratch_bytes: usize,
+    cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    metadata: Vec<crate::preservation::Metadata>,
+    root_metadata: crate::preservation::Metadata,
     extents: Vec<Vec<Extent>>,
 }
 
@@ -501,12 +571,34 @@ impl<'a> UdfReader<'a> {
     /// Symbolic links are decoded without following targets; directory aliases
     /// are rejected. Chained file sets select the greatest set/descriptor number.
     pub fn open(bytes: &'a [u8], limits: Limits) -> Result<Self> {
-        if bytes.len() as u64 > limits.max_input_bytes {
+        Self::open_source(crate::source::SliceSource::new(bytes), limits)
+    }
+
+    /// Retain an immutable fixed-length source for metadata and deferred payload reads.
+    pub fn open_source<S: crate::source::ReadAt + 'a>(source: S, limits: Limits) -> Result<Self> {
+        Self::open_source_with_limits(source, limits, SourceLimits::default())
+    }
+    /// Open with shared discovery/payload read limits and cooperative cancellation.
+    pub fn open_source_with_limits<S: crate::source::ReadAt + 'a>(
+        source: S,
+        limits: Limits,
+        source_limits: SourceLimits,
+    ) -> Result<Self> {
+        let read_bytes = std::rc::Rc::new(std::cell::Cell::new(0));
+        let scratch_bytes = source_limits.max_scratch_bytes.min(64 * 1024);
+        let cancelled = source_limits.cancelled.clone();
+        let source = ControlledSource {
+            source,
+            limits: source_limits,
+            used: read_bytes.clone(),
+        };
+        let bytes: &dyn crate::source::ReadAt = &source;
+        if bytes.len() > limits.max_input_bytes {
             return Err(Error::ResourceLimit("input bytes"));
         }
         let mut metadata_bytes = 0u64;
         let descriptors = discovery::discover(bytes, limits, &mut metadata_bytes)?;
-        let logical = descriptors.logical;
+        let logical = descriptors.logical.as_slice();
         if u32_at(logical, 212)? != 2048
             || !matches!(
                 u16_at(logical, 240)?,
@@ -587,6 +679,8 @@ impl<'a> UdfReader<'a> {
         }
         let mut visited_directories = HashSet::new();
         let mut entries = Vec::new();
+        let mut metadata = Vec::new();
+        let mut root_metadata = None;
         let mut locations = Vec::new();
         let mut total_bytes = 0u64;
         let mut object_sizes = Vec::new();
@@ -721,7 +815,7 @@ impl<'a> UdfReader<'a> {
                             !descriptor_block.mirror,
                         )
                         .map_err(|mirror_error| {
-                            if matches!(mirror_error, Error::ResourceLimit(_)) {
+                            if matches!(mirror_error, Error::ResourceLimit(_) | Error::Io(_)) {
                                 mirror_error
                             } else {
                                 error
@@ -731,6 +825,11 @@ impl<'a> UdfReader<'a> {
                     Err(error) => return Err(error),
                 }
             };
+            let inspected =
+                crate::preservation::inspect_udf_file_entry(descriptor, raw_name.clone());
+            if path.is_empty() && !stream_directory && stream.is_none() {
+                root_metadata = Some(inspected.clone());
+            }
             let mut owner = None;
             if !path.is_empty() && !stream_directory {
                 if entries.len() as u64 >= limits.max_entries {
@@ -762,6 +861,7 @@ impl<'a> UdfReader<'a> {
                 } else {
                     None
                 };
+                metadata.push(inspected);
                 entries.push(Entry {
                     kind: entry_kind,
                     stream: stream.clone(),
@@ -914,8 +1014,14 @@ impl<'a> UdfReader<'a> {
             }
         }
         Ok(Self {
-            bytes,
+            bytes: Box::new(source),
             entries,
+            metadata_bytes,
+            read_bytes,
+            scratch_bytes,
+            cancelled,
+            metadata,
+            root_metadata: root_metadata.ok_or_else(|| bad("missing root metadata"))?,
             extents: locations,
         })
     }
@@ -924,27 +1030,114 @@ impl<'a> UdfReader<'a> {
     pub fn entries(&self) -> &[Entry] {
         &self.entries
     }
-    /// Stream recorded extents and zero-fill sparse regions in bounded chunks.
-    /// UDF descriptor checksums do not authenticate file payloads.
-    pub fn extract(&self, index: usize, output: &mut impl Write) -> Result<u64> {
+    fn check_cancelled(&self) -> Result<()> {
+        if self.cancelled.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "UDF source cancelled",
+            )
+            .into());
+        }
+        Ok(())
+    }
+    /// Cumulative discovery metadata charged against Limits.
+    pub fn metadata_bytes(&self) -> u64 {
+        self.metadata_bytes
+    }
+    /// Cumulative requested source bytes, including metadata and repeated payload reads.
+    pub fn source_read_bytes(&self) -> u64 {
+        self.read_bytes.get()
+    }
+    /// Native inspected metadata for an indexed entry.
+    pub fn metadata(&self, index: usize) -> Option<&crate::preservation::Metadata> {
+        self.metadata.get(index)
+    }
+    /// Native inspected metadata for the file set root.
+    pub fn root_metadata(&self) -> &crate::preservation::Metadata {
+        &self.root_metadata
+    }
+
+    /// Read file or stream bytes into caller storage. EOF returns zero; reads are
+    /// clamped to logical size and holes yield zeros. Source failures propagate.
+    pub fn read_at(&self, index: usize, offset: u64, output: &mut [u8]) -> Result<usize> {
+        self.check_cancelled()?;
         let entry = self
             .entries
             .get(index)
             .ok_or_else(|| bad("unknown entry ID"))?;
-        if !entry.directory {
-            let zeros = [0u8; 64 * 1024];
-            for extent in &self.extents[index] {
-                if let Some(offset) = extent.offset {
-                    output.write_all(region(self.bytes, offset, extent.length)?)?;
+        let length = entry.size.saturating_sub(offset).min(output.len() as u64) as usize;
+        let mut written = 0usize;
+        let mut logical = 0u64;
+        for extent in &self.extents[index] {
+            let end = logical
+                .checked_add(extent.length)
+                .ok_or_else(|| bad("extent overflow"))?;
+            if offset + (written as u64) < end && written < length {
+                let skip = (offset + written as u64).saturating_sub(logical);
+                let count = (extent.length - skip).min((length - written) as u64) as usize;
+                let chunk = &mut output[written..written + count];
+                if let Some(source_offset) = extent.offset {
+                    self.bytes.read_exact_at(
+                        source_offset
+                            .checked_add(skip)
+                            .ok_or_else(|| bad("extent overflow"))?,
+                        chunk,
+                    )?;
                 } else {
-                    let mut remaining = extent.length;
-                    while remaining != 0 {
-                        let length = remaining.min(zeros.len() as u64) as usize;
-                        output.write_all(&zeros[..length])?;
-                        remaining -= length as u64;
-                    }
+                    chunk.fill(0);
                 }
+                written += count;
             }
+            logical = end;
+            if written == length {
+                break;
+            }
+        }
+        if written != length {
+            return Err(bad("payload extent size mismatch"));
+        }
+        Ok(written)
+    }
+
+    /// Visit file-relative logical extents; None denotes a hole and source
+    /// offsets are relative to the retained source, including embedded data.
+    pub fn visit_extents(
+        &self,
+        index: usize,
+        mut visitor: impl FnMut(u64, Option<u64>, u64) -> Result<()>,
+    ) -> Result<()> {
+        self.entries
+            .get(index)
+            .ok_or_else(|| bad("unknown entry ID"))?;
+        let mut logical = 0u64;
+        self.check_cancelled()?;
+        for extent in &self.extents[index] {
+            self.check_cancelled()?;
+            visitor(logical, extent.offset, extent.length)?;
+            logical = logical
+                .checked_add(extent.length)
+                .ok_or_else(|| bad("extent overflow"))?;
+        }
+        Ok(())
+    }
+
+    /// Stream recorded extents and zero-fill sparse regions in bounded chunks.
+    /// UDF descriptor checksums do not authenticate file payloads.
+    pub fn extract(&self, index: usize, output: &mut impl Write) -> Result<u64> {
+        self.check_cancelled()?;
+        let entry = self
+            .entries
+            .get(index)
+            .ok_or_else(|| bad("unknown entry ID"))?;
+        let mut buffer = vec![0; self.scratch_bytes];
+        if buffer.is_empty() && entry.size != 0 {
+            return Err(Error::ResourceLimit("scratch bytes"));
+        }
+        let mut offset = 0;
+        while offset < entry.size {
+            let count = self.read_at(index, offset, &mut buffer)?;
+            output.write_all(&buffer[..count])?;
+            offset += count as u64;
         }
         Ok(entry.size)
     }

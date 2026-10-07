@@ -143,6 +143,7 @@ fn indirect_icb_is_resolved_and_cycles_are_rejected() {
     let reader = UdfReader::open(&image, Limits::default()).unwrap();
     assert_eq!(reader.read_entry(0, 7).unwrap(), b"payload");
     assert_eq!(reader.entries()[0].icb.block, 3);
+    drop(reader);
     let indirect = &mut image[(PARTITION + 2) * BLOCK..(PARTITION + 3) * BLOCK];
     put32(indirect, 40, 2);
     seal(indirect, 259, 2, 52, 3);
@@ -209,4 +210,177 @@ fn strategy_4096_terminal_entry_selects_direct_data() {
             .unwrap(),
         b"payload"
     );
+}
+
+struct LogicalImage {
+    prefix: Vec<u8>,
+    failure: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+impl libmkiso::source::ReadAt for LogicalImage {
+    fn len(&self) -> u64 {
+        32 << 30
+    }
+    fn read_at(&self, offset: u64, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if self.failure.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected payload failure",
+            ));
+        }
+        let count = buffer
+            .len()
+            .min(13)
+            .min(self.len().saturating_sub(offset) as usize);
+        buffer[..count].fill(0);
+        for (i, byte) in buffer[..count].iter_mut().enumerate() {
+            if let Some(value) = self.prefix.get(offset as usize + i) {
+                *byte = *value;
+            }
+        }
+        Ok(count)
+    }
+}
+#[test]
+fn retained_large_positional_source_random_reads_and_shared_controls() {
+    use libmkiso::source::BoundedSource;
+    use libmkiso::udf::{Error, SourceLimits};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    let failure = Arc::new(AtomicBool::new(false));
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let mut prefix = vec![7; 511];
+    prefix.extend(fixture(0x201, false, false));
+    let source = BoundedSource::new(
+        LogicalImage {
+            prefix,
+            failure: failure.clone(),
+        },
+        511,
+        16 << 30,
+    )
+    .unwrap();
+    let reader = UdfReader::open_source_with_limits(
+        source,
+        Limits::default(),
+        SourceLimits {
+            cancelled: cancelled.clone(),
+            max_scratch_bytes: 128,
+            max_read_bytes: 4 << 20,
+        },
+    )
+    .unwrap();
+    assert!(reader.metadata_bytes() < 64 * 1024);
+    assert!(reader.source_read_bytes() < 1 << 20);
+    let mut buffer = [0; 20];
+    for offset in [0, 3, 6, 2, 3] {
+        let count = reader.read_at(0, offset, &mut buffer).unwrap();
+        assert_eq!(&buffer[..count], &b"payload"[offset as usize..]);
+    }
+    assert_eq!(reader.read_at(0, u64::MAX, &mut buffer).unwrap(), 0);
+    failure.store(true, Ordering::Relaxed);
+    assert!(
+        matches!(reader.read_at(0, 0, &mut buffer), Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::PermissionDenied)
+    );
+    failure.store(false, Ordering::Relaxed);
+    cancelled.store(true, Ordering::Relaxed);
+    assert!(
+        matches!(reader.read_at(0, 0, &mut buffer), Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::Interrupted)
+    );
+}
+#[test]
+fn positional_discovery_failure_and_shared_read_budget() {
+    use libmkiso::udf::SourceLimits;
+    let failure = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    assert!(
+        matches!(UdfReader::open_source(LogicalImage { prefix: fixture(0x201, false, false), failure }, Limits::default()), Err(libmkiso::udf::Error::Io(error)) if error.kind() == std::io::ErrorKind::PermissionDenied)
+    );
+    assert!(
+        UdfReader::open_source_with_limits(
+            libmkiso::source::SliceSource::new(&fixture(0x201, false, false)),
+            Limits::default(),
+            SourceLimits {
+                max_read_bytes: 2047,
+                ..SourceLimits::default()
+            }
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn holes_are_visible_and_cancellation_applies_without_source_reads() {
+    use libmkiso::udf::SourceLimits;
+    let mut image = fixture(0x201, false, false);
+    let file = &mut image[(PARTITION + 2) * BLOCK..(PARTITION + 3) * BLOCK];
+    put32(file, 176, (2 << 30) | BLOCK as u32);
+    seal(file, 261, 2, 192, 3);
+    let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reader = UdfReader::open_source_with_limits(
+        libmkiso::source::SliceSource::new(&image),
+        Limits::default(),
+        SourceLimits {
+            cancelled: cancelled.clone(),
+            ..SourceLimits::default()
+        },
+    )
+    .unwrap();
+    let mut extents = Vec::new();
+    reader
+        .visit_extents(0, |logical, source, size| {
+            extents.push((logical, source, size));
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(extents, [(0, None, 7)]);
+    assert_eq!(reader.read_entry(0, 7).unwrap(), [0; 7]);
+    cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+    assert!(reader.read_entry(0, 7).is_err());
+    assert!(reader.visit_extents(0, |_, _, _| Ok(())).is_err());
+}
+
+#[cfg(feature = "native-writer")]
+#[test]
+fn author_from_retained_reader_without_extraction() {
+    use libmkiso::{
+        udf_tree::UdfTreeSource,
+        udf_writer::{UdfImage, UdfOptions},
+    };
+    let source = LogicalImage {
+        prefix: fixture(0x201, false, false),
+        failure: Default::default(),
+    };
+    #[allow(clippy::arc_with_non_send_sync)]
+    let source = UdfTreeSource(std::sync::Arc::new(
+        UdfReader::open_source(source, Limits::default()).unwrap(),
+    ));
+    let image = UdfImage::from_tree_source(&source, 10, 64 * 1024).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let output = directory.path().join("reader-copy.udf");
+    image.write(&output, &UdfOptions::default()).unwrap();
+    let bytes = std::fs::read(output).unwrap();
+    let copied = UdfReader::open(&bytes, Limits::default()).unwrap();
+    assert_eq!(copied.read_entry(0, 7).unwrap(), b"payload");
+}
+
+#[test]
+fn deferred_repeated_reads_share_the_discovery_budget() {
+    use libmkiso::{source::SliceSource, udf::SourceLimits};
+    let image = fixture(0x201, false, false);
+    let baseline = UdfReader::open(&image, Limits::default())
+        .unwrap()
+        .source_read_bytes();
+    let reader = UdfReader::open_source_with_limits(
+        SliceSource::new(&image),
+        Limits::default(),
+        SourceLimits {
+            max_read_bytes: baseline + 7,
+            ..SourceLimits::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(reader.read_entry(0, 7).unwrap(), b"payload");
+    assert_eq!(reader.source_read_bytes(), baseline + 7);
+    assert!(reader.read_entry(0, 7).is_err());
 }

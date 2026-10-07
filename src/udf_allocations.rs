@@ -1,7 +1,7 @@
 //! Bounded short/long/extended UDF allocation descriptors, including sparse data and AED chains.
 use std::collections::HashSet;
 
-use super::{Error, Limits, Result, bad, region, tag, u16_at, u32_at};
+use super::{Error, Limits, Result, bad, tag, u16_at, u32_at};
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Extent {
@@ -21,7 +21,11 @@ fn charge(budget: &mut u64, amount: u64, limits: Limits) -> Result<()> {
 }
 
 /// Assemble only recorded metadata; sparse blocks cannot carry descriptors.
-pub(super) fn read_recorded(bytes: &[u8], extents: &[Extent], length: u64) -> Result<Vec<u8>> {
+pub(super) fn read_recorded(
+    bytes: &dyn crate::source::ReadAt,
+    extents: &[Extent],
+    length: u64,
+) -> Result<Vec<u8>> {
     let mut result = Vec::new();
     for extent in extents {
         if (result.len() as u64)
@@ -33,7 +37,14 @@ pub(super) fn read_recorded(bytes: &[u8], extents: &[Extent], length: u64) -> Re
         let offset = extent
             .offset
             .ok_or_else(|| bad("unrecorded metadata extent"))?;
-        result.extend_from_slice(region(bytes, offset, extent.length)?);
+        let start = result.len();
+        let end = start
+            .checked_add(
+                usize::try_from(extent.length).map_err(|_| bad("metadata size conversion"))?,
+            )
+            .ok_or_else(|| bad("metadata size overflow"))?;
+        result.resize(end, 0);
+        bytes.read_exact_at(offset, &mut result[start..end])?;
     }
     if result.len() as u64 != length {
         return Err(bad("resolved metadata size mismatch"));
@@ -46,7 +57,7 @@ pub(super) fn read_recorded(bytes: &[u8], extents: &[Extent], length: u64) -> Re
     reason = "allocation context and partition resolver remain explicit"
 )]
 pub(super) fn decode(
-    bytes: &[u8],
+    bytes: &dyn crate::source::ReadAt,
     initial: &[u8],
     allocation_type: u16,
     current_partition: u16,
@@ -73,7 +84,7 @@ pub(super) fn decode(
     reason = "allocation context and partition resolver remain explicit"
 )]
 pub(super) fn decode_metadata(
-    bytes: &[u8],
+    bytes: &dyn crate::source::ReadAt,
     initial: &[u8],
     allocation_type: u16,
     current_partition: u16,
@@ -100,7 +111,7 @@ pub(super) fn decode_metadata(
     reason = "allocation context and partition resolver remain explicit"
 )]
 fn decode_profile(
-    bytes: &[u8],
+    bytes: &dyn crate::source::ReadAt,
     initial: &[u8],
     allocation_type: u16,
     current_partition: u16,
