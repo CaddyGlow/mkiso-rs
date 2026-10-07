@@ -105,11 +105,12 @@ pub fn prepare(
         libmkiso::boot_media::plan::InventoryLimits::default(),
         ctx,
     )?;
+    let stage_root = stage.path().canonicalize()?;
     for fingerprint in &mut fingerprints {
         fingerprint.path = output.join(
             fingerprint
                 .path
-                .strip_prefix(stage.path())
+                .strip_prefix(&stage_root)
                 .map_err(|e| Error::InvalidInput(e.to_string()))?,
         );
     }

@@ -1,9 +1,11 @@
 [package]
 name = "libmkiso"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.99"
 license = "MIT"
+repository = "https://github.com/CaddyGlow/mkiso-rs"
+readme = "README.md"
 description = "ISO9660, Joliet and UDF readers with deterministic optical image writers"
 
 [dependencies]

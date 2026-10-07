@@ -940,6 +940,7 @@ mod linux {
                 fs::hard_link(&temporary_path, &output)?;
                 fs::remove_file(&temporary_path)?;
             }
+            #[cfg(unix)]
             File::open(parent)?.sync_all()?;
             Ok(VentoyReport {
                 image: output.clone(),

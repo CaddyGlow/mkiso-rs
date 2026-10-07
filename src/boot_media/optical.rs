@@ -534,6 +534,7 @@ pub fn extract(
         ctx.checkpoint()?;
         publish_directory(staging.path(), &output)?;
         #[cfg(unix)]
+        #[cfg(unix)]
         File::open(parent)?.sync_all()?;
         Ok(())
     })();
@@ -920,6 +921,7 @@ pub fn create(
             fs::hard_link(&image, &output)?;
         }
         #[cfg(unix)]
+        #[cfg(unix)]
         File::open(parent)?.sync_all()?;
         Ok(())
     })();
@@ -1100,6 +1102,7 @@ pub fn repack(
         } else {
             fs::hard_link(&staged_image, &output)?;
         }
+        #[cfg(unix)]
         #[cfg(unix)]
         File::open(parent)?.sync_all()?;
         Ok(())
