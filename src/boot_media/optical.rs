@@ -912,7 +912,12 @@ pub fn create(
         ProgressState::Started,
     );
     let flushed = (|| {
-        File::open(&image)?.sync_all()?;
+        // FlushFileBuffers on Windows requires a writable handle.
+        File::options()
+            .read(true)
+            .write(true)
+            .open(&image)?
+            .sync_all()?;
         ctx.checkpoint()?;
         destination(&output, options.replace, &[source])?;
         if options.replace {

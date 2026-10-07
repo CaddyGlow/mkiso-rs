@@ -234,8 +234,10 @@ fn independent_fe_and_efe_metadata_keep_native_fields_across_revisions() {
                 &[72, 84, 96]
             };
             let stamp = [0x3c, 0x10, 0xea, 0x07, 10, 7, 12, 34, 56, 78, 90, 12];
-            for &offset in offsets {
-                descriptor[offset..offset + 12].copy_from_slice(&stamp);
+            for (index, &offset) in offsets.iter().enumerate() {
+                let mut value = stamp;
+                value[11] += index as u8;
+                descriptor[offset..offset + 12].copy_from_slice(&value);
             }
             seal(
                 descriptor,
@@ -252,12 +254,25 @@ fn independent_fe_and_efe_metadata_keep_native_fields_across_revisions() {
                 panic!("timestamps not inspected")
             };
             assert_eq!(timestamps.len(), offsets.len());
-            assert!(
-                timestamps
-                    .iter()
-                    .all(|(_, timestamp)| timestamp.bytes == stamp
-                        && timestamp.encoding == TimestampEncoding::Udf)
-            );
+            for (kind, timestamp) in timestamps {
+                let index = match *kind {
+                    4 => 0,
+                    2 => 1,
+                    1 if extended => 2,
+                    8 => {
+                        if extended {
+                            3
+                        } else {
+                            2
+                        }
+                    }
+                    _ => panic!("unexpected timestamp field"),
+                };
+                let mut expected = stamp;
+                expected[11] += index;
+                assert_eq!(timestamp.bytes, expected);
+                assert_eq!(timestamp.encoding, TimestampEncoding::Udf);
+            }
             assert_eq!(timestamps.iter().any(|(kind, _)| *kind == 1), extended);
         }
     }

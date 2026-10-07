@@ -41,6 +41,33 @@ fn staged_udf_and_iso_emit_deferred_payloads() {
         reader.read_entry(index, 200_000).unwrap(),
         vec![0x5a; 200_000]
     );
+    let independent = ["7zz", "7z"].into_iter().find(|executable| {
+        std::process::Command::new(executable)
+            .arg("i")
+            .output()
+            .is_ok_and(|output| {
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .filter(|line| line.starts_with("7-Zip"))
+                    .flat_map(str::split_whitespace)
+                    .filter_map(|word| word.split('.').next()?.parse::<u32>().ok())
+                    .any(|major| major >= 20)
+            })
+    });
+    if let Some(independent) = independent {
+        let output = std::process::Command::new(independent)
+            .args(["e", "-so", "-tUdf"])
+            .arg(&path)
+            .arg("FILE.BIN")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.stdout, vec![0x5a; 200_000]);
+    }
     let path =
         stage_iso9660_from_tree_source(&source(), directory.path(), &IsoOptions::default(), || {
             Ok(())
@@ -301,33 +328,9 @@ fn retained_reader_authors_large_files_streams_links_and_holes_without_extractio
     assert!(sparse[..2048].iter().all(|&byte| byte == 0x61));
     assert!(sparse[2048..6144].iter().all(|&byte| byte == 0));
     assert_eq!(&sparse[6144..], b"end");
-    let independent = ["7zz", "7z"].into_iter().find(|executable| {
-        std::process::Command::new(executable)
-            .arg("i")
-            .output()
-            .is_ok_and(|output| {
-                String::from_utf8_lossy(&output.stdout)
-                    .lines()
-                    .filter(|line| line.starts_with("7-Zip"))
-                    .flat_map(str::split_whitespace)
-                    .filter_map(|word| word.split('.').next()?.parse::<u32>().ok())
-                    .any(|major| major >= 20)
-            })
-    });
-    if let Some(independent) = independent {
-        let output = std::process::Command::new(independent)
-            .args(["e", "-so", "-tUdf"])
-            .arg(&staged)
-            .arg("file")
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert_eq!(output.stdout, vec![0x65; 200_000]);
-    }
+    // 7-Zip rejects UDF symbolic-link file types. Keep the combined topology
+    // fixture checked here, and validate ordinary staged content independently
+    // in staged_udf_and_iso_emit_deferred_payloads.
 }
 
 #[test]

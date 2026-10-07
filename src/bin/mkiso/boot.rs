@@ -100,6 +100,8 @@ pub fn prepare(
     let mut file = fs::File::create(stage.path().join("boot/grub/grub.cfg"))?;
     file.write_all(config.as_bytes())?;
     file.sync_all()?;
+    // Windows cannot rename the staging directory while a child is open.
+    drop(file);
     let mut fingerprints = libmkiso::boot_media::plan::inventory_with_context(
         stage.path(),
         libmkiso::boot_media::plan::InventoryLimits::default(),

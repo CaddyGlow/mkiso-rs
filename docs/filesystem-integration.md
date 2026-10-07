@@ -3,7 +3,7 @@
 This development implementation follows `FILESYSTEM_REFACTOR_PLAN.md` without
 adding dependencies on partmgr, virtdisk, or an external filesystem core.
 The minimum **published** libmkiso version for every API below is **UNKNOWN**.
-Cargo version 0.1.2 is a local version, not evidence of crates.io availability.
+Cargo version 0.1.3 is a local version, not evidence of crates.io availability.
 Consumers must verify a published release and resolve its manifests/lockfiles
 without sibling path overrides before release integration.
 

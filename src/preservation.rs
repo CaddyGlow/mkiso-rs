@@ -395,7 +395,7 @@ pub(crate) fn inspect_udf_file_entry(descriptor: &[u8], raw_name: Vec<u8>) -> Me
             .map(u32::from_le_bytes)
     };
     let timestamps: Vec<_> = if extended {
-        vec![(4, 80), (2, 92), (8, 104), (1, 116)]
+        vec![(4, 80), (2, 92), (1, 104), (8, 116)]
     } else {
         vec![(4, 72), (2, 84), (8, 96)]
     };
