@@ -98,12 +98,34 @@ pub struct Index {
     pub extents: Vec<Vec<Extent>>,
 }
 
+/// Semantic native leaf identifier in the selected namespace.
+/// Versions are retained. Invalid Joliet/Rock Ridge encodings are rejected.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum NativeName {
+    /// Primary stored identifier bytes, including any version suffix.
+    Primary(Vec<u8>),
+    /// Joliet big-endian UTF-16 units, including any version suffix.
+    Joliet(Vec<u16>),
+    /// Rock Ridge NM bytes, or the primary identifier when NM is absent.
+    RockRidge(Vec<u8>),
+}
+/// Parallel native namespace index, addressing `Index::entries`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Topology {
+    /// Ordinary parent per entry. Root is source-scoped and synthetic: ISO has
+    /// no public root object identifier. It never refers to a display path.
+    pub parents: Vec<crate::topology::Parent>,
+    /// Semantic native leaf names; `Entry::raw_name` retains stored identifiers.
+    pub names: Vec<NativeName>,
+}
+
 /// Seekable ISO9660 image with a validated selected-namespace index.
 pub struct IsoReader<R> {
     reader: R,
     index: Index,
     root_metadata: crate::preservation::Metadata,
     metadata: Vec<crate::preservation::Metadata>,
+    topology: Topology,
 }
 
 impl<R: Read + Seek> IsoReader<R> {
@@ -120,12 +142,14 @@ impl<R: Read + Seek> IsoReader<R> {
 
     /// Read a selected namespace with bounded metadata traversal.
     pub fn open_with_options(mut reader: R, options: ReadOptions) -> Result<Self> {
-        let (index, root_metadata, metadata) = read_index_inspected(&mut reader, options)?;
+        let (index, root_metadata, metadata, topology) =
+            read_index_inspected(&mut reader, options)?;
         Ok(Self {
             reader,
             index,
             root_metadata,
             metadata,
+            topology,
         })
     }
 
@@ -139,6 +163,10 @@ impl<R: Read + Seek> IsoReader<R> {
         &self.index
     }
 
+    /// Native parent/name index built during directory traversal.
+    pub fn topology(&self) -> &Topology {
+        &self.topology
+    }
     /// Native root fields inspected in the selected namespace.
     pub fn root_metadata(&self) -> &crate::preservation::Metadata {
         &self.root_metadata
@@ -165,6 +193,25 @@ impl<R: Read + Seek> IsoReader<R> {
         Vec<crate::preservation::Metadata>,
     ) {
         (self.reader, self.index, self.root_metadata, self.metadata)
+    }
+
+    /// Consume the reader while retaining native topology and inspected fields.
+    pub fn into_topology_parts(
+        self,
+    ) -> (
+        R,
+        Index,
+        crate::preservation::Metadata,
+        Vec<crate::preservation::Metadata>,
+        Topology,
+    ) {
+        (
+            self.reader,
+            self.index,
+            self.root_metadata,
+            self.metadata,
+            self.topology,
+        )
     }
 
     /// Read one payload into memory with an explicit maximum allocation size.
@@ -300,7 +347,7 @@ pub fn read_index_with_options<R: Read + Seek>(
     reader: &mut R,
     options: ReadOptions,
 ) -> Result<Index> {
-    read_index_inspected(reader, options).map(|(index, _, _)| index)
+    read_index_inspected(reader, options).map(|(index, _, _, _)| index)
 }
 
 fn read_index_inspected<R: Read + Seek>(
@@ -310,6 +357,7 @@ fn read_index_inspected<R: Read + Seek>(
     Index,
     crate::preservation::Metadata,
     Vec<crate::preservation::Metadata>,
+    Topology,
 )> {
     let limits = options.limits;
     let input_size = reader.seek(SeekFrom::End(0))?;
@@ -447,7 +495,17 @@ fn read_index_inspected<R: Read + Seek>(
     }
     let root_metadata = inspected_metadata(&root_entry, &primary[174..181], use_rr);
     let mut entry_metadata = Vec::new();
-    let mut queue = VecDeque::from([(String::new(), root.extent, root.size, 0usize)]);
+    let mut queue = VecDeque::from([(
+        String::new(),
+        root.extent,
+        root.size,
+        0usize,
+        crate::topology::Parent::Root,
+    )]);
+    let mut topology = Topology {
+        parents: Vec::new(),
+        names: Vec::new(),
+    };
     let mut visited = HashSet::new();
     let mut entries = Vec::new();
     let mut offsets = Vec::new();
@@ -456,7 +514,7 @@ fn read_index_inspected<R: Read + Seek>(
     let mut directory_bytes = rr_metadata
         .checked_add(inspection_bytes)
         .ok_or(Error::ResourceLimit("ISO inspected metadata bytes"))?;
-    while let Some((parent, extent, size, depth)) = queue.pop_front() {
+    while let Some((parent, extent, size, depth, parent_index)) = queue.pop_front() {
         if depth > limits.max_nesting_depth {
             return Err(Error::ResourceLimit("ISO directory depth"));
         }
@@ -493,6 +551,22 @@ fn read_index_inspected<R: Read + Seek>(
                     if pending.is_some() || child.more {
                         return Err(malformed("interrupted ISO multi-extent file"));
                     }
+                    let expected = if child.name == [0] {
+                        extent
+                    } else {
+                        match parent_index {
+                            crate::topology::Parent::Root => root.extent,
+                            crate::topology::Parent::Entry(index) => {
+                                match topology.parents[index] {
+                                    crate::topology::Parent::Root => root.extent,
+                                    crate::topology::Parent::Entry(ancestor) => offsets[ancestor],
+                                }
+                            }
+                        }
+                    };
+                    if !child.directory || child.extent != expected {
+                        return Err(malformed("inconsistent ISO directory parent/self record"));
+                    }
                     continue;
                 }
                 if child.more
@@ -514,6 +588,27 @@ fn read_index_inspected<R: Read + Seek>(
                     )?
                 } else {
                     crate::rock_ridge::Attributes::default()
+                };
+                let native_name = if use_rr {
+                    NativeName::RockRidge(
+                        attributes
+                            .name
+                            .as_ref()
+                            .map_or_else(|| child.name.to_vec(), |name| name.as_bytes().to_vec()),
+                    )
+                } else if use_joliet {
+                    if !child.name.len().is_multiple_of(2) || child.name.len() > 206 {
+                        return Err(malformed("invalid Joliet identifier length"));
+                    }
+                    NativeName::Joliet(
+                        child
+                            .name
+                            .chunks_exact(2)
+                            .map(|p| u16::from_be_bytes([p[0], p[1]]))
+                            .collect(),
+                    )
+                } else {
+                    NativeName::Primary(child.name.to_vec())
                 };
                 let mut leaf = if use_joliet {
                     if !child.name.len().is_multiple_of(2) || child.name.len() > 206 {
@@ -555,6 +650,7 @@ fn read_index_inspected<R: Read + Seek>(
                 if let Some(index) = pending {
                     let previous: &mut Entry = &mut entries[index];
                     if previous.raw_name != child.name
+                        || topology.names[index] != native_name
                         || previous.name != name
                         || child.directory
                         || previous.unix != attributes.metadata
@@ -582,8 +678,8 @@ fn read_index_inspected<R: Read + Seek>(
                     pending = child.more.then_some(index);
                     continue;
                 }
-                if !names.insert(name.clone()) {
-                    return Err(malformed("duplicate ISO display name"));
+                if !names.insert(native_name.clone()) {
+                    return Err(malformed("duplicate ISO native name"));
                 }
                 metadata_bytes = metadata_bytes
                     .checked_add(name.len() as u64)
@@ -595,8 +691,30 @@ fn read_index_inspected<R: Read + Seek>(
                     return Err(Error::ResourceLimit("entries"));
                 }
                 if child.directory {
-                    queue.push_back((name.clone(), child.extent, child.size, depth + 1));
+                    queue.push_back((
+                        name.clone(),
+                        child.extent,
+                        child.size,
+                        depth + 1,
+                        crate::topology::Parent::Entry(entries.len()),
+                    ));
                 }
+                let name_bytes = match &native_name {
+                    NativeName::Primary(bytes) | NativeName::RockRidge(bytes) => bytes.len(),
+                    NativeName::Joliet(units) => units.len() * 2,
+                };
+                directory_bytes = directory_bytes
+                    .checked_add(
+                        (name_bytes
+                            + std::mem::size_of::<crate::topology::Parent>()
+                            + std::mem::size_of::<NativeName>()) as u64,
+                    )
+                    .ok_or(Error::ResourceLimit("ISO topology bytes"))?;
+                if directory_bytes > limits.max_metadata_bytes {
+                    return Err(Error::ResourceLimit("ISO topology bytes"));
+                }
+                topology.parents.push(parent_index);
+                topology.names.push(native_name);
                 entries.push(Entry {
                     raw_name: child.name.to_vec(),
                     name,
@@ -646,6 +764,7 @@ fn read_index_inspected<R: Read + Seek>(
         },
         root_metadata,
         entry_metadata,
+        topology,
     ))
 }
 

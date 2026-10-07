@@ -193,8 +193,12 @@ fn fixed_options_produce_identical_images_and_hashes() {
             },
             ..Default::default()
         };
-        let first = directory.path().join(format!("first-{partition:?}.udf"));
-        let second = directory.path().join(format!("second-{partition:?}.udf"));
+        let first = directory
+            .path()
+            .join(format!("first-{partition:?}.udf").replace(':', "_"));
+        let second = directory
+            .path()
+            .join(format!("second-{partition:?}.udf").replace(':', "_"));
         let first_hash = image.write(&first, &options).unwrap();
         let second_hash = image.write(&second, &options).unwrap();
         assert_eq!(first_hash, second_hash);

@@ -160,6 +160,8 @@ fn named_and_system_streams_have_structured_owners_and_extractable_data() {
                 EntryKind::NamedStream
             }
         );
+        assert_eq!(reader.parent(index), None);
+        assert_eq!(reader.parent(0), Some(libmkiso::topology::Parent::Root));
         let stream = entry.stream.as_ref().unwrap();
         assert_eq!(stream.owner, if system { None } else { Some(0) });
         assert_eq!(stream.name, "metadata");
@@ -198,4 +200,34 @@ fn object_size_must_account_for_actual_associated_stream_bytes() {
     put64(file, 64, 11);
     seal(file, 266, 2, 223, 3);
     assert!(UdfReader::open(&image, Limits::default()).is_err());
+}
+
+#[test]
+fn root_stream_ownership_is_distinct_from_ordinary_parent_topology() {
+    let mut image = fixture(0x201, true, true);
+    add_stream(&mut image, false);
+    let file = &mut image[(PARTITION + 2) * BLOCK..(PARTITION + 3) * BLOCK];
+    put64(file, 64, 7);
+    put32(file, 152, 0);
+    seal(file, 266, 2, 223, 3);
+    let root = &mut image[(PARTITION + 1) * BLOCK..(PARTITION + 2) * BLOCK];
+    let fid = root[176..220].to_vec();
+    root[64..].fill(0);
+    put64(root, 64, 47);
+    put32(root, 152, BLOCK as u32);
+    put32(root, 156, 3);
+    put32(root, 212, 44);
+    root[216..260].copy_from_slice(&fid);
+    seal(root, 266, 1, 260, 3);
+    let reader = UdfReader::open(&image, Limits::default()).unwrap();
+    let index = reader
+        .entries()
+        .iter()
+        .position(|entry| entry.stream.is_some())
+        .unwrap();
+    let stream = reader.entries()[index].stream.as_ref().unwrap();
+    assert_eq!(stream.owner, None);
+    assert!(!stream.system);
+    assert_eq!(reader.parent(index), None);
+    assert_eq!(reader.read_entry(index, 3).unwrap(), b"ads");
 }

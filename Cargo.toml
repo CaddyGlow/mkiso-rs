@@ -7,6 +7,7 @@ license = "MIT"
 repository = "https://github.com/CaddyGlow/mkiso-rs"
 readme = "README.md"
 description = "ISO9660, Joliet and UDF readers with deterministic optical image writers"
+exclude = ["FILESYSTEM*_PLAN.md"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"], optional = true }

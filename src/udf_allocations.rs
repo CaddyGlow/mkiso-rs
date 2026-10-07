@@ -6,6 +6,7 @@ use super::{Error, Limits, Result, bad, tag, u16_at, u32_at};
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Extent {
     pub offset: Option<u64>,
+    pub allocated_unrecorded: bool,
     pub length: u64,
     pub logical_byte: u64,
 }
@@ -225,6 +226,7 @@ fn decode_profile(
                 charge(budget, std::mem::size_of::<Extent>() as u64, limits)?;
                 extents.push(Extent {
                     offset: None,
+                    allocated_unrecorded: false,
                     length: information,
                     logical_byte: u64::from(block) * 2048,
                 });
@@ -240,6 +242,7 @@ fn decode_profile(
                     remaining_information -= extent.length;
                     if kind == 1 {
                         extent.offset = None;
+                        extent.allocated_unrecorded = true;
                     }
                     charge(budget, std::mem::size_of::<Extent>() as u64, limits)?;
                     extents.push(extent);

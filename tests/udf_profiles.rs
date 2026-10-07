@@ -111,6 +111,30 @@ fn physical_partition_revisions_read_long_and_embedded_file_entries() {
                 let image = fixture(revision, extended, embedded);
                 let reader = UdfReader::open(&image, Limits::default()).unwrap();
                 assert_eq!(reader.entries()[0].name, "file");
+                let before = reader.source_read_bytes();
+                let mut extents = Vec::new();
+                reader
+                    .visit_classified_extents(0, |logical, kind, length| {
+                        extents.push((logical, kind, length));
+                        Ok(())
+                    })
+                    .unwrap();
+                assert_eq!(reader.source_read_bytes(), before);
+                let source_offset = if embedded {
+                    (PARTITION + 2) * BLOCK + if extended { 216 } else { 176 }
+                } else {
+                    (PARTITION + 4) * BLOCK
+                };
+                assert_eq!(
+                    extents,
+                    [(
+                        0,
+                        libmkiso::UdfExtentKind::Recorded {
+                            source_offset: source_offset as u64
+                        },
+                        7
+                    )]
+                );
                 assert_eq!(reader.read_entry(0, 7).unwrap(), b"payload");
             }
         }

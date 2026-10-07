@@ -80,6 +80,39 @@ fn allocated_and_unallocated_sparse_extents_extract_zeroes() {
         let mut expected = vec![0; 2048];
         expected.extend_from_slice(b"hello world");
         assert_eq!(read(&bytes), expected);
+        let reader = UdfReader::open(&bytes, Limits::default()).unwrap();
+        let index = reader
+            .entries()
+            .iter()
+            .position(|entry| entry.name == "payload.txt")
+            .unwrap();
+        let mut classified = Vec::new();
+        reader
+            .visit_classified_extents(index, |logical, class, length| {
+                classified.push((logical, class, length));
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            classified[0],
+            (
+                0,
+                if kind == 1 {
+                    libmkiso::UdfExtentKind::AllocatedUnrecorded
+                } else {
+                    libmkiso::UdfExtentKind::Unallocated
+                },
+                2048
+            )
+        );
+        let mut legacy = Vec::new();
+        reader
+            .visit_extents(index, |logical, offset, length| {
+                legacy.push((logical, offset, length));
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(legacy[0], (0, None, 2048));
     }
 }
 
@@ -333,4 +366,48 @@ fn empty_file_can_have_preallocated_tail() {
     put32(block, 180, payload);
     retag(block, 168);
     assert!(read(&bytes).is_empty());
+}
+
+#[test]
+fn sparse_continuation_classification_distinguishes_both_zero_classes() {
+    for kind in [1u32, 2] {
+        let (mut bytes, aed_offset) = chain_fixture(false);
+        let aed = &mut bytes[aed_offset..aed_offset + BLOCK];
+        put32(aed, 24, (kind << 30) | 11);
+        retag(aed, 16);
+        let reader = UdfReader::open(&bytes, Limits::default()).unwrap();
+        let index = reader
+            .entries()
+            .iter()
+            .position(|entry| entry.name == "payload.txt")
+            .unwrap();
+        let mut classes = Vec::new();
+        reader
+            .visit_classified_extents(index, |logical, class, length| {
+                classes.push((logical, class, length));
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            classes,
+            [(
+                0,
+                if kind == 1 {
+                    libmkiso::UdfExtentKind::AllocatedUnrecorded
+                } else {
+                    libmkiso::UdfExtentKind::Unallocated
+                },
+                11
+            )]
+        );
+        assert_eq!(reader.read_entry(index, 11).unwrap(), [0; 11]);
+        let mut legacy = Vec::new();
+        reader
+            .visit_extents(index, |logical, offset, length| {
+                legacy.push((logical, offset, length));
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(legacy, [(0, None, 11)]);
+    }
 }

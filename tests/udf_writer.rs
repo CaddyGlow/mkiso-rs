@@ -101,7 +101,7 @@ fn populated_virtual_sparable_and_metadata_maps_round_trip() {
         };
         let path = dir
             .path()
-            .join(format!("{:?}-{:?}.udf", revision, partition));
+            .join(format!("{:?}-{:?}.udf", revision, partition).replace(':', "_"));
         image.write(&path, &options).unwrap();
         let bytes = std::fs::read(path).unwrap();
         let reader = UdfReader::open(&bytes, Limits::default()).unwrap();
@@ -226,6 +226,23 @@ fn allocated_sparse_body_and_preallocation_have_distinct_extended_information_le
         expected.extend(vec![0; 6144]);
         expected.extend([3; 7]);
         assert_eq!(reader.read_entry(0, 10000).unwrap(), expected);
+        let mut classes = Vec::new();
+        reader
+            .visit_classified_extents(0, |logical, kind, length| {
+                classes.push((logical, kind, length));
+                Ok(())
+            })
+            .unwrap();
+        assert!(classes.iter().any(|&(logical, kind, _)| logical == 2048
+            && kind == libmkiso::UdfExtentKind::AllocatedUnrecorded));
+        assert!(
+            classes.iter().any(|&(logical, kind, _)| logical == 6144
+                && kind == libmkiso::UdfExtentKind::Unallocated)
+        );
+        assert_eq!(
+            classes.iter().map(|(_, _, length)| length).sum::<u64>(),
+            8199
+        );
     }
 }
 #[test]
@@ -271,7 +288,9 @@ fn streams_sparse_links_and_file_set_chains_work_across_partition_profiles() {
         image
             .add_system_stream("system", b"system".to_vec())
             .unwrap();
-        let path = directory.path().join(format!("{:?}.udf", partition));
+        let path = directory
+            .path()
+            .join(format!("{:?}.udf", partition).replace(':', "_"));
         let options = UdfOptions {
             revision,
             partition,
@@ -301,6 +320,22 @@ fn streams_sparse_links_and_file_set_chains_work_across_partition_profiles() {
         expected.extend(vec![0; 4096]);
         expected.extend([7; 3]);
         assert_eq!(reader.read_entry(index, 10000).unwrap(), expected);
+        let mut classes = Vec::new();
+        reader
+            .visit_classified_extents(index, |logical, kind, length| {
+                classes.push((logical, kind, length));
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            classes[1],
+            (2048, libmkiso::UdfExtentKind::AllocatedUnrecorded, 2048)
+        );
+        assert_eq!(
+            classes[2],
+            (4096, libmkiso::UdfExtentKind::Unallocated, 2048)
+        );
+
         assert!(
             reader
                 .entries()

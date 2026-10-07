@@ -8,6 +8,7 @@ pub mod iso_tree_source;
 pub mod preservation;
 pub mod rock_ridge;
 pub mod source;
+pub mod topology;
 pub mod tree_source;
 pub mod udf;
 pub use source::{BoundedSource, ReadAt, SliceSource, SourceCursor};
@@ -22,7 +23,8 @@ pub use iso9660::{
 pub use rock_ridge::UnixMetadata;
 pub use udf::{
     Entry as UdfEntry, EntryKind as UdfEntryKind, Error as UdfError, IcbIdentity as UdfIcbIdentity,
-    Limits as UdfLimits, Result as UdfResult, StreamInfo as UdfStreamInfo, UdfReader,
+    Limits as UdfLimits, Result as UdfResult, StreamInfo as UdfStreamInfo, UdfExtentKind,
+    UdfReader,
 };
 
 #[cfg(feature = "native-writer")]

@@ -256,7 +256,8 @@ fn retained_reader_authors_large_files_streams_links_and_holes_without_extractio
             "sparse",
             vec![
                 UdfFileExtent::Data(vec![0x61; 2048]),
-                UdfFileExtent::Hole(4096),
+                UdfFileExtent::Hole(2048),
+                UdfFileExtent::AllocatedHole(2048),
                 UdfFileExtent::Data(b"end".to_vec()),
             ],
         )
@@ -278,6 +279,7 @@ fn retained_reader_authors_large_files_streams_links_and_holes_without_extractio
             .any(|entry| matches!(entry.kind, TreeEntryKind::HardLink(_)))
     );
     assert!(inventory.entries.iter().any(|entry| matches!(&entry.kind, TreeEntryKind::File(extents) if extents.iter().any(|extent| matches!(extent, TreeExtent::Hole(_))))));
+    assert!(inventory.entries.iter().any(|entry| matches!(&entry.kind, TreeEntryKind::File(extents) if extents.iter().any(|extent| matches!(extent, TreeExtent::AllocatedHole(_))))));
     let copy = UdfImage::from_tree_source(&source, 20, 32 * 1024).unwrap();
     drop(source);
     drop(inventory);

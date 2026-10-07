@@ -140,11 +140,17 @@ impl FileTreeSource for UdfTreeSource {
                     } else {
                         let mut extents = Vec::new();
                         self.0
-                            .visit_extents(index, |logical, recorded, length| {
-                                extents.push(if recorded.is_some() {
-                                    TreeExtent::Data(self.content(index, logical, length))
-                                } else {
-                                    TreeExtent::Hole(length)
+                            .visit_classified_extents(index, |logical, kind, length| {
+                                extents.push(match kind {
+                                    crate::udf::UdfExtentKind::Recorded { .. } => {
+                                        TreeExtent::Data(self.content(index, logical, length))
+                                    }
+                                    crate::udf::UdfExtentKind::Unallocated => {
+                                        TreeExtent::Hole(length)
+                                    }
+                                    crate::udf::UdfExtentKind::AllocatedUnrecorded => {
+                                        TreeExtent::AllocatedHole(length)
+                                    }
                                 });
                                 Ok(())
                             })

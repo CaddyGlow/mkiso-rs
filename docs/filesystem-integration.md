@@ -57,6 +57,73 @@ Because the new reader owns a retained source with a destructor, callers must
 drop a borrowed reader before mutating its backing image, including after the
 last payload call. This is also required by the immutable-source contract.
 
+## Native topology and classified extents (additive 0.1.3)
+
+These APIs require no default features, and are available on the portable wasm
+reader path. The local implementation version is **0.1.3**; its minimum
+**crates.io-published** version remains **UNKNOWN** until registry publication is
+verified independently of a local/path dependency or a GitHub release.
+
+```rust,ignore
+topology::Parent::{Root, Entry(usize)};
+UdfReader::parent(&self, index: usize) -> Option<topology::Parent>;
+UdfReader::root_icb(&self) -> udf::IcbIdentity;
+IsoReader::topology(&self) -> &iso9660::Topology;
+IsoReader::into_topology_parts(self) -> (
+    R, iso9660::Index, preservation::Metadata,
+    Vec<preservation::Metadata>, iso9660::Topology,
+);
+iso_tree_source::IsoTreeSource::topology(&self) -> &iso9660::Topology;
+udf::UdfExtentKind::{Recorded { source_offset: u64 }, Unallocated, AllocatedUnrecorded};
+UdfReader::visit_classified_extents(&self, index: usize,
+    visitor: impl FnMut(u64, udf::UdfExtentKind, u64) -> UdfResult<()>) -> UdfResult<()>;
+```
+
+`Parent::Entry` addresses a directory occurrence in the same reader's `entries()`;
+`Root` is an explicit sentinel outside that index. Parents are recorded while
+traversing native directory records, never inferred from display paths. Every
+ordinary UDF occurrence has a parent, including separate hard-link names sharing
+an ICB. Streams return `None` from `parent`: their existing `StreamInfo::owner`
+and `system` fields preserve named, root and system ownership separately. An
+invalid entry index also returns `None`. `root_icb()` reports the resolved root
+ICB. ISO uses a synthetic, reader-scoped `Parent::Root` identity; no public
+record identity or guessed display entry stands in for its root.
+
+`iso9660::Topology` holds parallel `parents: Vec<Parent>` and
+`names: Vec<NativeName>`. Semantic leaf identifiers are `NativeName::Primary`
+identifier bytes (including versions), `Joliet` UTF-16 units, or `RockRidge` NM
+bytes (primary identifier bytes when NM is absent). `Entry::raw_name` always
+retains the separately stored directory identifier. Invalid primary bytes remain
+explicit; unsupported Joliet surrogates and non-UTF8 Rock Ridge NM are rejected.
+Lossy primary display names and stripped versions may collapse display paths,
+but distinct native occurrences stay indexed. Indexed extraction remains usable;
+the path-based authoring adapter rejects ambiguous display paths before staging.
+Existing `Entry` constructors, `Index`, `into_parts`, and `into_inspected_parts`
+retain their signatures. Topology and native-name retention are charged to the
+existing discovery metadata limits; native directory cycles/aliases and
+inconsistent ISO parent/self records are rejected.
+
+The classified visitor does not allocate or read payload. It yields only logical
+file bytes, clipping allocation padding and excluding preallocated tails. Partition
+translation, embedded payloads and descriptor continuations retain recorded source
+offsets and both zero classes. Both zero classes read as zero bytes. The original
+`visit_extents` is a wrapper that maps both to `None`, preserving compatibility;
+consumers requiring allocation semantics must use the classified visitor. The UDF
+deferred inventory maps these classes to `TreeExtent::Hole` and `AllocatedHole`.
+Cancellation precedes every callback and discovery resource limits still apply.
+
+A partmgr adapter can map root and directory occurrences directly into its common
+TreeSource, use native leaf identifiers for explicit destination conversion, and
+inspect shared ICB/Rock Ridge serial identities plus stream and metadata fields
+before requesting any FAT destination mutation. Native versions, unsupported
+encodings, destination name collisions, hard links, streams and metadata must be
+converted explicitly or rejected by that builder's preflight. This repository
+provides the codec-owned contract and rejection tests; the actual partmgr FAT
+builder integration remains a downstream gate, not a verified libmkiso claim.
+The optional public inventory lease extension is not introduced: current private
+staging adapters must continue retaining their own reservation, including for
+empty/directory-only inventories and staged artifacts.
+
 ## Deferred inventories and staging (R2)
 
 Portable `tree_source` exposes `ContentSource`, `SourceIdentity`,

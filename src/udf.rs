@@ -393,6 +393,7 @@ struct Pending {
     icb_length: u32,
     stream: Option<StreamInfo>,
     stream_directory: bool,
+    parent: crate::topology::Parent,
 }
 
 fn decode_link(data: &[u8]) -> Result<String> {
@@ -551,6 +552,17 @@ impl<S: crate::source::ReadAt> crate::source::ReadAt for ControlledSource<S> {
     }
 }
 
+/// Allocation class of a file-relative logical UDF extent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UdfExtentKind {
+    /// Recorded bytes at an offset relative to the retained source.
+    Recorded { source_offset: u64 },
+    /// Unallocated sparse storage; reads yield zeroes.
+    Unallocated,
+    /// Allocated storage whose bytes are not recorded; reads yield zeroes.
+    AllocatedUnrecorded,
+}
+
 /// Bounded UDF reader over caller-owned bytes.
 pub struct UdfReader<'a> {
     bytes: Box<dyn crate::source::ReadAt + 'a>,
@@ -561,6 +573,8 @@ pub struct UdfReader<'a> {
     cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
     metadata: Vec<crate::preservation::Metadata>,
     root_metadata: crate::preservation::Metadata,
+    root_icb: IcbIdentity,
+    parents: Vec<Option<crate::topology::Parent>>,
     extents: Vec<Vec<Extent>>,
 }
 
@@ -660,6 +674,7 @@ impl<'a> UdfReader<'a> {
             icb_length: root_length,
             stream: None,
             stream_directory: false,
+            parent: crate::topology::Parent::Root,
         }]);
         if u32_at(&file_set, 464)? != 0 {
             queue.push_back(Pending {
@@ -675,12 +690,15 @@ impl<'a> UdfReader<'a> {
                     system: true,
                 }),
                 stream_directory: true,
+                parent: crate::topology::Parent::Root,
             });
         }
         let mut visited_directories = HashSet::new();
         let mut entries = Vec::new();
         let mut metadata = Vec::new();
         let mut root_metadata = None;
+        let mut root_icb = None;
+        let mut parents = Vec::new();
         let mut locations = Vec::new();
         let mut total_bytes = 0u64;
         let mut object_sizes = Vec::new();
@@ -695,6 +713,7 @@ impl<'a> UdfReader<'a> {
                 icb_length,
                 stream,
                 stream_directory,
+                parent,
             } = pending;
             if depth > limits.max_nesting_depth {
                 return Err(Error::ResourceLimit("UDF nesting depth"));
@@ -774,6 +793,7 @@ impl<'a> UdfReader<'a> {
                     let length = (extent.length - skip).min(remain);
                     embedded.push(Extent {
                         offset: extent.offset.map(|offset| offset + skip),
+                        allocated_unrecorded: extent.allocated_unrecorded,
                         length,
                         logical_byte: extent.logical_byte + skip,
                     });
@@ -829,6 +849,10 @@ impl<'a> UdfReader<'a> {
                 crate::preservation::inspect_udf_file_entry(descriptor, raw_name.clone());
             if path.is_empty() && !stream_directory && stream.is_none() {
                 root_metadata = Some(inspected.clone());
+                root_icb = Some(IcbIdentity {
+                    partition: reference,
+                    block: location,
+                });
             }
             let mut owner = None;
             if !path.is_empty() && !stream_directory {
@@ -861,6 +885,12 @@ impl<'a> UdfReader<'a> {
                 } else {
                     None
                 };
+                charge_metadata(
+                    &mut metadata_bytes,
+                    std::mem::size_of::<Option<crate::topology::Parent>>() as u64,
+                    limits,
+                )?;
+                parents.push(if stream.is_none() { Some(parent) } else { None });
                 metadata.push(inspected);
                 entries.push(Entry {
                     kind: entry_kind,
@@ -909,6 +939,7 @@ impl<'a> UdfReader<'a> {
                         system: false,
                     }),
                     stream_directory: true,
+                    parent: crate::topology::Parent::Root,
                 });
             }
             if !directory {
@@ -989,6 +1020,10 @@ impl<'a> UdfReader<'a> {
                         icb_length: recorded_icb_length(fid, 20)?,
                         stream: child_stream,
                         stream_directory: false,
+                        parent: owner.map_or(
+                            crate::topology::Parent::Root,
+                            crate::topology::Parent::Entry,
+                        ),
                     });
                 }
                 position += length;
@@ -1022,6 +1057,8 @@ impl<'a> UdfReader<'a> {
             cancelled,
             metadata,
             root_metadata: root_metadata.ok_or_else(|| bad("missing root metadata"))?,
+            root_icb: root_icb.ok_or_else(|| bad("missing root ICB"))?,
+            parents,
             extents: locations,
         })
     }
@@ -1029,6 +1066,15 @@ impl<'a> UdfReader<'a> {
     /// Metadata in breadth-first stored directory order.
     pub fn entries(&self) -> &[Entry] {
         &self.entries
+    }
+    /// Ordinary parent relationship. Streams and invalid indices return None;
+    /// stream ownership remains available separately through `Entry::stream`.
+    pub fn parent(&self, index: usize) -> Option<crate::topology::Parent> {
+        self.parents.get(index).copied().flatten()
+    }
+    /// Resolved file set root ICB, in the same identity space as `Entry::icb`.
+    pub fn root_icb(&self) -> IcbIdentity {
+        self.root_icb
     }
     fn check_cancelled(&self) -> Result<()> {
         if self.cancelled.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1099,23 +1145,57 @@ impl<'a> UdfReader<'a> {
         Ok(written)
     }
 
-    /// Visit file-relative logical extents; None denotes a hole and source
-    /// offsets are relative to the retained source, including embedded data.
+    /// Compatibility visitor. Both zero classes map to None. Source offsets
+    /// remain relative to the retained source, including embedded data.
     pub fn visit_extents(
         &self,
         index: usize,
         mut visitor: impl FnMut(u64, Option<u64>, u64) -> Result<()>,
     ) -> Result<()> {
-        self.entries
+        self.visit_classified_extents(index, |logical, kind, length| {
+            let offset = match kind {
+                UdfExtentKind::Recorded { source_offset } => Some(source_offset),
+                UdfExtentKind::Unallocated | UdfExtentKind::AllocatedUnrecorded => None,
+            };
+            visitor(logical, offset, length)
+        })
+    }
+
+    /// Visit allocation classes without reading payload or allocating a buffer.
+    /// Extents are clipped to logical file size; preallocated tails are excluded.
+    /// Cancellation is checked before traversal and before every callback.
+    pub fn visit_classified_extents(
+        &self,
+        index: usize,
+        mut visitor: impl FnMut(u64, UdfExtentKind, u64) -> Result<()>,
+    ) -> Result<()> {
+        let entry = self
+            .entries
             .get(index)
             .ok_or_else(|| bad("unknown entry ID"))?;
         let mut logical = 0u64;
+        let logical_size = if entry.directory {
+            entry.stored_size
+        } else {
+            entry.size
+        };
         self.check_cancelled()?;
         for extent in &self.extents[index] {
             self.check_cancelled()?;
-            visitor(logical, extent.offset, extent.length)?;
+            let length = extent.length.min(logical_size.saturating_sub(logical));
+            if length == 0 {
+                continue;
+            }
+            let kind = if let Some(source_offset) = extent.offset {
+                UdfExtentKind::Recorded { source_offset }
+            } else if extent.allocated_unrecorded {
+                UdfExtentKind::AllocatedUnrecorded
+            } else {
+                UdfExtentKind::Unallocated
+            };
+            visitor(logical, kind, length)?;
             logical = logical
-                .checked_add(extent.length)
+                .checked_add(length)
                 .ok_or_else(|| bad("extent overflow"))?;
         }
         Ok(())

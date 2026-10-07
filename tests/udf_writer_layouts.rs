@@ -85,7 +85,7 @@ fn fragmented_metadata_maps_cross_extent_boundaries_and_recover_duplicate_mirror
         ] {
             let output = directory
                 .path()
-                .join(format!("fragment-{revision:?}-{partition:?}.udf"));
+                .join(format!("fragment-{revision:?}-{partition:?}.udf").replace(':', "_"));
             let options = UdfOptions {
                 revision,
                 partition,
@@ -175,7 +175,9 @@ fn authored_sparing_replacements_survive_loss_of_original_packets() {
             packet_blocks: 32,
         },
     ] {
-        let output = directory.path().join(format!("spared-{partition:?}.udf"));
+        let output = directory
+            .path()
+            .join(format!("spared-{partition:?}.udf").replace(':', "_"));
         let options = UdfOptions {
             revision: if matches!(partition, UdfPartition::MetadataSparable { .. }) {
                 UdfRevision::V260

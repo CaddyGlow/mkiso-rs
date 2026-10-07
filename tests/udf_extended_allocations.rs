@@ -94,6 +94,31 @@ fn extended_sparse_descriptors_extract_only_information_length() {
         let (mut bytes, entry, payload) = fixture();
         extended(&mut bytes, entry, payload, kind, 2048, 0, 11);
         assert_eq!(read(&bytes), [0; 11]);
+        let reader = UdfReader::open(&bytes, Limits::default()).unwrap();
+        let index = reader
+            .entries()
+            .iter()
+            .position(|entry| entry.name == "payload.txt")
+            .unwrap();
+        let mut extents = Vec::new();
+        reader
+            .visit_classified_extents(index, |logical, class, length| {
+                extents.push((logical, class, length));
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            extents,
+            [(
+                0,
+                if kind == 1 {
+                    libmkiso::UdfExtentKind::AllocatedUnrecorded
+                } else {
+                    libmkiso::UdfExtentKind::Unallocated
+                },
+                11
+            )]
+        );
     }
 }
 #[test]

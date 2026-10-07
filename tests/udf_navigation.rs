@@ -188,6 +188,8 @@ fn hard_link_names_share_resolved_identity() {
     let reader = UdfReader::open(&image, Limits::default()).unwrap();
     assert_eq!(reader.entries().len(), 2);
     assert_eq!(reader.entries()[0].icb, reader.entries()[1].icb);
+    assert_eq!(reader.parent(0), Some(libmkiso::topology::Parent::Root));
+    assert_eq!(reader.parent(1), Some(libmkiso::topology::Parent::Root));
     assert_eq!(reader.read_entry(1, 7).unwrap(), b"payload");
 }
 #[test]
@@ -338,6 +340,16 @@ fn holes_are_visible_and_cancellation_applies_without_source_reads() {
     cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
     assert!(reader.read_entry(0, 7).is_err());
     assert!(reader.visit_extents(0, |_, _, _| Ok(())).is_err());
+    let mut callbacks = 0;
+    assert!(
+        reader
+            .visit_classified_extents(0, |_, _, _| {
+                callbacks += 1;
+                Ok(())
+            })
+            .is_err()
+    );
+    assert_eq!(callbacks, 0);
 }
 
 #[cfg(feature = "native-writer")]
@@ -383,4 +395,53 @@ fn deferred_repeated_reads_share_the_discovery_budget() {
     assert_eq!(reader.read_entry(0, 7).unwrap(), b"payload");
     assert_eq!(reader.source_read_bytes(), baseline + 7);
     assert!(reader.read_entry(0, 7).is_err());
+}
+
+#[test]
+fn independent_nested_topology_and_root_icb_are_indexed_during_traversal() {
+    use libmkiso::{UdfIcbIdentity, topology::Parent};
+    let mut image = fixture(0x201, false, true);
+    image.copy_within(
+        (PARTITION + 2) * BLOCK..(PARTITION + 3) * BLOCK,
+        (PARTITION + 3) * BLOCK,
+    );
+    seal(
+        &mut image[(PARTITION + 3) * BLOCK..(PARTITION + 4) * BLOCK],
+        261,
+        3,
+        183,
+        3,
+    );
+    let root = &mut image[(PARTITION + 1) * BLOCK..(PARTITION + 2) * BLOCK];
+    root[176 + 18] = 2;
+    root[215..219].copy_from_slice(b"dirx");
+    seal(&mut root[176..220], 257, 1, 44, 3);
+    seal(root, 261, 1, 220, 3);
+    let mut fid = root[176..220].to_vec();
+    fid[18] = 0;
+    fid[39..43].copy_from_slice(b"leaf");
+    put32(&mut fid, 24, 3);
+    seal(&mut fid, 257, 2, 44, 3);
+    let directory = &mut image[(PARTITION + 2) * BLOCK..(PARTITION + 3) * BLOCK];
+    directory.fill(0);
+    put16(directory, 20, 4);
+    directory[27] = 4;
+    put16(directory, 34, 3);
+    put64(directory, 56, 44);
+    put32(directory, 172, 44);
+    directory[176..220].copy_from_slice(&fid);
+    seal(directory, 261, 2, 220, 3);
+    let reader = UdfReader::open(&image, Limits::default()).unwrap();
+    assert_eq!(
+        reader.root_icb(),
+        UdfIcbIdentity {
+            partition: 0,
+            block: 1
+        }
+    );
+    assert_eq!(reader.parent(0), Some(Parent::Root));
+    assert_eq!(reader.parent(1), Some(Parent::Entry(0)));
+    assert_eq!(reader.parent(99), None);
+    assert_eq!(reader.entries()[1].raw_name, b"\x08leaf");
+    assert_eq!(reader.read_entry(1, 7).unwrap(), b"payload");
 }

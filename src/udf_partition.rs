@@ -315,6 +315,7 @@ impl VolumeMap {
                     .ok_or_else(|| bad("referenced unallocated metadata block"))?;
                 result.push(Extent {
                     offset: Some(offset + from - position),
+                    allocated_unrecorded: false,
                     length: to - from,
                     logical_byte: from,
                 });
@@ -453,6 +454,7 @@ fn physical(start: u64, size: u64, block: u32, length: u64) -> Result<Vec<Extent
     }
     Ok(vec![Extent {
         offset: Some(start + offset),
+        allocated_unrecorded: false,
         length,
         logical_byte: offset,
     }])
@@ -523,6 +525,7 @@ fn translate(
             }
             extents.push(Extent {
                 offset: Some(absolute),
+                allocated_unrecorded: false,
                 length: amount,
                 logical_byte: u64::from(block) * BLOCK,
             });

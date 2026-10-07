@@ -2,7 +2,7 @@
 //!
 //! Native metadata preservation needs a separate preflight. ISO has no UDF named,
 //! root or system stream namespace, so those inventories are explicitly empty.
-use crate::iso9660::{Extent, Index, IsoReader};
+use crate::iso9660::{Extent, Index, IsoReader, NativeName, Topology};
 use crate::source::{ReadAt, SourceCursor};
 use crate::tree_source::{
     ContentSource, DeferredContent, FileTreeSource, SourceIdentity, TreeEntry, TreeEntryKind,
@@ -18,16 +18,22 @@ pub struct IsoTreeSource<S> {
     index: Index,
     root_metadata: crate::preservation::Metadata,
     metadata: Vec<crate::preservation::Metadata>,
+    topology: Topology,
 }
 impl<S: ReadAt + 'static> IsoTreeSource<S> {
     pub fn new(reader: IsoReader<SourceCursor<S>>) -> Self {
-        let (cursor, index, root_metadata, metadata) = reader.into_inspected_parts();
+        let (cursor, index, root_metadata, metadata, topology) = reader.into_topology_parts();
         Self {
             source: Arc::new(cursor.into_inner()),
             index,
             root_metadata,
             metadata,
+            topology,
         }
+    }
+    /// Native namespace relationships retained from the reader.
+    pub fn topology(&self) -> &Topology {
+        &self.topology
     }
     pub fn index(&self) -> &Index {
         &self.index
@@ -121,6 +127,7 @@ impl<S: ReadAt + 'static> FileTreeSource for IsoTreeSource<S> {
                 std::mem::size_of::<TreeEntry>(),
                 entry.name.len(),
                 entry.raw_name.len(),
+                entry.name.len() + std::mem::size_of::<&str>(), // display collision scratch
                 self.metadata[position].allocation_bytes(),
                 extent_bytes,
                 std::mem::size_of::<TreeExtent>(),
@@ -134,6 +141,17 @@ impl<S: ReadAt + 'static> FileTreeSource for IsoTreeSource<S> {
                 if bytes > maximum_bytes {
                     return Err(io::Error::other("inventory byte budget exceeded"));
                 }
+            }
+        }
+        // This path-based authoring adapter requires explicit name conversion
+        // when distinct native occurrences collapse to one display path.
+        let mut paths = std::collections::HashSet::new();
+        for entry in &self.index.entries {
+            if !paths.insert(entry.name.as_str()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "native ISO names require explicit conversion: duplicate display path",
+                ));
             }
         }
         let mut inventory = TreeInventory {
@@ -192,7 +210,12 @@ impl<S: ReadAt + 'static> FileTreeSource for IsoTreeSource<S> {
             };
             inventory.entries.push(TreeEntry {
                 path: entry.name.clone(),
-                native_name: entry.raw_name.clone(),
+                native_name: match &self.topology.names[position] {
+                    NativeName::Primary(bytes) | NativeName::RockRidge(bytes) => bytes.clone(),
+                    NativeName::Joliet(units) => {
+                        units.iter().flat_map(|unit| unit.to_be_bytes()).collect()
+                    }
+                },
                 metadata: self.metadata[position].clone(),
                 object,
                 kind,
