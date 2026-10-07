@@ -127,16 +127,17 @@ fn create_verify_extract_preserves_source_and_json_stdout() {
         String::from_utf8_lossy(&verify.stderr)
     );
     let extracted = temp.path().join("extracted");
+    let extract = mkiso()
+        .arg("extract")
+        .arg(&image)
+        .arg("--output")
+        .arg(&extracted)
+        .output()
+        .unwrap();
     assert!(
-        mkiso()
-            .arg("extract")
-            .arg(&image)
-            .arg("--output")
-            .arg(&extracted)
-            .output()
-            .unwrap()
-            .status
-            .success()
+        extract.status.success(),
+        "{}",
+        String::from_utf8_lossy(&extract.stderr)
     );
     assert_eq!(
         std::fs::read(extracted.join("hello.txt")).unwrap(),

@@ -476,7 +476,23 @@ fn publish_directory(source: &Path, destination: &Path) -> Result<()> {
         fs::rename(source, destination)?;
         Ok(())
     }
-    #[cfg(not(any(target_os = "linux", windows)))]
+    #[cfg(target_os = "macos")]
+    {
+        use std::{ffi::CString, os::unix::ffi::OsStrExt};
+        let source = CString::new(source.as_os_str().as_bytes())
+            .map_err(|_| Error::InvalidInput("NUL in staging path".into()))?;
+        let destination = CString::new(destination.as_os_str().as_bytes())
+            .map_err(|_| Error::InvalidInput("NUL in output path".into()))?;
+        // The live, NUL-terminated paths are valid for this call. RENAME_EXCL
+        // atomically rejects an existing destination, including an empty directory.
+        if unsafe { libc::renamex_np(source.as_ptr(), destination.as_ptr(), libc::RENAME_EXCL) }
+            != 0
+        {
+            return Err(io::Error::last_os_error().into());
+        }
+        Ok(())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
         let _ = (source, destination);
         Err(Error::Unsupported(
@@ -1126,4 +1142,28 @@ pub fn repack(
     published?;
     built.image = output;
     Ok(built)
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos", windows)))]
+mod publication_tests {
+    use super::*;
+
+    #[test]
+    fn directory_publication_never_replaces_a_concurrent_destination() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("staging");
+        let destination = temp.path().join("destination");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("payload"), b"staged").unwrap();
+        fs::create_dir(&destination).unwrap();
+        assert!(publish_directory(&source, &destination).is_err());
+        assert!(destination.is_dir());
+        assert_eq!(fs::read_dir(&destination).unwrap().count(), 0);
+        assert_eq!(fs::read(source.join("payload")).unwrap(), b"staged");
+        fs::remove_dir(&destination).unwrap();
+        fs::write(&destination, b"concurrent").unwrap();
+        assert!(publish_directory(&source, &destination).is_err());
+        assert_eq!(fs::read(&destination).unwrap(), b"concurrent");
+        assert_eq!(fs::read(source.join("payload")).unwrap(), b"staged");
+    }
 }
