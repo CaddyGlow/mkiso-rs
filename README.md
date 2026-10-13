@@ -399,11 +399,11 @@ for entry in reader.entries() {
 Push a tag matching the Cargo package version, such as `v0.1.0`, to release.
 The workflow waits for CI, verifies the tag/version match and crate packaging,
 and builds `mkiso` for Linux x86-64, Windows x86-64, and macOS ARM64. Binaries
-include the `cli` and `progress` features. It publishes `libmkiso` to crates.io
-and creates a GitHub Release with binary tarballs, the MIT license, and SHA-256
-checksums. Tags with prerelease suffixes create GitHub prereleases.
+include the `cli` and `progress` features. It creates a GitHub Release with the
+crate package, binary tarballs, the MIT license, and SHA-256 checksums. Tags with
+prerelease suffixes create GitHub prereleases.
 
-Set the repository secret `CARGO_REGISTRY_TOKEN` to a crates.io token authorized
-to publish `libmkiso` before pushing a release tag. Release binaries embed the
-tag in `--version`; local builds use the Cargo version unless `MKISO_BUILD_TAG`
+Publish `libmkiso` separately with `cargo publish --locked` using a crates.io
+token authorized for the package before pushing a release tag. Release binaries
+embed the tag in `--version`; local builds use the Cargo version unless `MKISO_BUILD_TAG`
 is set at compile time.

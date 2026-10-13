@@ -1,8 +1,8 @@
 [package]
 name = "libmkiso"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
-rust-version = "1.99"
+rust-version = "1.96"
 license = "MIT"
 repository = "https://github.com/CaddyGlow/mkiso-rs"
 readme = "README.md"
@@ -63,7 +63,3 @@ required-features = ["cli"]
 [[test]]
 name = "media_optical"
 required-features = ["cli"]
-
-[lints.clippy]
-# Preserve established iterator/remainder handling during the Rust 1.99 upgrade.
-chunks_exact_to_as_chunks = "allow"

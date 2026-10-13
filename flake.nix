@@ -28,11 +28,12 @@
         system:
         let
           pkgs = pkgsFor system;
-          rust = pkgs.rust-bin.stable."1.99.0".default.override {
+          rust = pkgs.rust-bin.stable."1.96.0".default.override {
             extensions = [ "rust-src" ];
             targets = [
               "x86_64-pc-windows-msvc"
               "i686-pc-windows-msvc"
+              "wasm32-unknown-unknown"
             ];
           };
         in
